@@ -1,0 +1,47 @@
+package controller
+
+import "github.com/liyansum/Xray/common/limiter"
+
+type Config struct {
+	ListenIP                string                           `mapstructure:"ListenIP"`
+	SendIP                  string                           `mapstructure:"SendIP"`
+	UpdatePeriodic          int                              `mapstructure:"UpdatePeriodic"`
+	DeviceOnlineMinTraffic  int                              `mapstructure:"DeviceOnlineMinTraffic"`
+	CertConfig              *CertConfig                      `mapstructure:"CertConfig"`
+	EnableDNS               bool                             `mapstructure:"EnableDNS"`
+	DNSType                 string                           `mapstructure:"DNSType"`
+	DisableUploadTraffic    bool                             `mapstructure:"DisableUploadTraffic"`
+	DisableGetRule          bool                             `mapstructure:"DisableGetRule"`
+	EnableProxyProtocol     bool                             `mapstructure:"EnableProxyProtocol"`
+	EnableFallback          bool                             `mapstructure:"EnableFallback"`
+	DisableIVCheck          bool                             `mapstructure:"DisableIVCheck"`
+	DisableSniffing         bool                             `mapstructure:"DisableSniffing"`
+	AutoSpeedLimitConfig    *AutoSpeedLimitConfig            `mapstructure:"AutoSpeedLimitConfig"`
+	GlobalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig `mapstructure:"GlobalDeviceLimitConfig"`
+	FallBackConfigs         []*FallBackConfig                `mapstructure:"FallBackConfigs"`
+}
+
+// CertConfig configures a TLS certificate supplied by the operator.
+// Automatic certificate issuance is intentionally not supported.
+type CertConfig struct {
+	CertMode                 string `mapstructure:"CertMode"` // none or file
+	CertFile                 string `mapstructure:"CertFile"`
+	KeyFile                  string `mapstructure:"KeyFile"`
+	RejectUnknownSni         bool   `mapstructure:"RejectUnknownSni"`
+	DisableSessionResumption bool   `mapstructure:"DisableSessionResumption"`
+}
+
+type AutoSpeedLimitConfig struct {
+	Limit         int `mapstructure:"Limit"` // mbps
+	WarnTimes     int `mapstructure:"WarnTimes"`
+	LimitSpeed    int `mapstructure:"LimitSpeed"`    // mbps
+	LimitDuration int `mapstructure:"LimitDuration"` // minute
+}
+
+type FallBackConfig struct {
+	SNI              string `mapstructure:"SNI"`
+	Alpn             string `mapstructure:"Alpn"`
+	Path             string `mapstructure:"Path"`
+	Dest             string `mapstructure:"Dest"`
+	ProxyProtocolVer uint64 `mapstructure:"ProxyProtocolVer"`
+}

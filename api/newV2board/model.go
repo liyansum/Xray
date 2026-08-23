@@ -1,0 +1,46 @@
+package newV2board
+
+type serverConfig struct {
+	shadowsocks
+	trojan
+
+	ServerPort int `json:"server_port"`
+	BaseConfig struct {
+		PushInterval int `json:"push_interval"`
+		PullInterval int `json:"pull_interval"`
+	} `json:"base_config"`
+	Routes []route `json:"routes"`
+}
+
+type shadowsocks struct {
+	Cipher       string `json:"cipher"`
+	Obfs         string `json:"obfs"`
+	ObfsSettings struct {
+		Path string `json:"path"`
+		Host string `json:"host"`
+	} `json:"obfs_settings"`
+	ServerKey string `json:"server_key"`
+}
+
+type trojan struct {
+	Host       string `json:"host"`
+	ServerName string `json:"server_name"`
+}
+
+type route struct {
+	Id          int      `json:"id"`
+	Match       []string `json:"match"`
+	Action      string   `json:"action"`
+	ActionValue string   `json:"action_value"`
+}
+
+type user struct {
+	Id          int    `json:"id"`
+	Uuid        string `json:"uuid"`
+	SpeedLimit  int    `json:"speed_limit"`
+	DeviceLimit int    `json:"device_limit"`
+}
+
+type AliveMap struct {
+	Alive map[int]int `json:"alive"`
+}

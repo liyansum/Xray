@@ -23,7 +23,7 @@ require (
 	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
-	github.com/xtls/xray-core v1.260327.1-0.20260812055538-6a66a74037d4
+	github.com/xtls/xray-core v0.0.0
 	golang.org/x/time v0.15.0
 	google.golang.org/protobuf v1.36.12
 )

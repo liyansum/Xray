@@ -54,7 +54,7 @@ func TestMultiProtocolAuthentication(t *testing.T) {
 		kind       inboundProtocol
 	}{
 		{name: "trojan", credential: trojanCredential, kind: inboundTrojan},
-		{name: "vless-vision", credential: vlessCredential, kind: inboundVLESSVision},
+		{name: "vless", credential: vlessCredential, kind: inboundVLESS},
 		{name: "anytls-v2", credential: anyTLSCredential[:], kind: inboundAnyTLS},
 	}
 	for _, test := range tests {
@@ -116,18 +116,20 @@ func makeVLESSRequest(t *testing.T, user *protocol.MemoryUser, flow string) []by
 	return append(request, destination.Bytes()...)
 }
 
-func TestVLESSVisionRequestRequiresFlow(t *testing.T) {
+func TestVLESSRequestFlowModes(t *testing.T) {
 	user := testMultiUser(t)
-	request := makeVLESSRequest(t, user, "xtls-rprx-vision")
-	id, destination, err := readVLESSVisionRequest(bytes.NewReader(request), user)
-	if err != nil {
-		t.Fatal(err)
+	for _, expectedFlow := range []string{"", "xtls-rprx-vision"} {
+		request := makeVLESSRequest(t, user, expectedFlow)
+		id, destination, flow, err := readVLESSRequest(bytes.NewReader(request), user)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(id) != 16 || destination.String() != "tcp:example.com:443" || flow != expectedFlow {
+			t.Fatalf("id=%x destination=%s flow=%q", id, destination.String(), flow)
+		}
 	}
-	if len(id) != 16 || destination.String() != "tcp:example.com:443" {
-		t.Fatalf("id=%x destination=%s", id, destination.String())
-	}
-	if _, _, err := readVLESSVisionRequest(bytes.NewReader(makeVLESSRequest(t, user, "")), user); err == nil {
-		t.Fatal("VLESS without flow was accepted")
+	if _, _, _, err := readVLESSRequest(bytes.NewReader(makeVLESSRequest(t, user, "unsupported-flow")), user); err == nil {
+		t.Fatal("unsupported VLESS flow was accepted")
 	}
 }
 

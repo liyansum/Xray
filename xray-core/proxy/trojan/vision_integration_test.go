@@ -191,6 +191,63 @@ func TestVLESSVisionOverExistingTLS(t *testing.T) {
 	}
 }
 
+func TestVLESSWithoutFlowOverExistingTLS(t *testing.T) {
+	server, user := testMultiServer(t)
+	server.policyManager = &testPolicyManager{}
+	dispatcher := &visionTestDispatcher{received: make(chan []byte, 1)}
+
+	serverRaw, clientRaw := stdnet.Pipe()
+	serverTLS := xraytls.Server(serverRaw, &gotls.Config{
+		Certificates: []gotls.Certificate{testTLSCertificate(t)}, MinVersion: gotls.VersionTLS12, MaxVersion: gotls.VersionTLS12,
+	}).(*xraytls.Conn)
+	clientTLS := gotls.Client(clientRaw, &gotls.Config{
+		InsecureSkipVerify: true, ServerName: "localhost", MinVersion: gotls.VersionTLS12, MaxVersion: gotls.VersionTLS12,
+	})
+	defer clientTLS.Close()
+	defer serverTLS.Close()
+
+	inbound := &session.Inbound{
+		Source: net.TCPDestination(net.LocalHostIP, 12346),
+		Local:  net.TCPDestination(net.LocalHostIP, 443),
+		Conn:   serverTLS,
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	done := make(chan error, 1)
+	go func() { done <- server.Process(ctx, net.Network_TCP, serverTLS, dispatcher) }()
+
+	request := append(makeVLESSRequest(t, user, ""), []byte("plain-request")...)
+	if _, err := clientTLS.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case received := <-dispatcher.received:
+		if string(received) != "plain-request" {
+			t.Fatalf("received %q", received)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("VLESS without flow request was not dispatched")
+	}
+	if inbound.Name != "vless" || inbound.User != user || inbound.CanSpliceCopy != 3 {
+		t.Fatalf("inbound name=%q user=%v splice=%d", inbound.Name, inbound.User, inbound.CanSpliceCopy)
+	}
+
+	response := make([]byte, 2+len("vision-response"))
+	if _, err := io.ReadFull(clientTLS, response); err != nil {
+		t.Fatal(err)
+	}
+	if response[0] != 0 || response[1] != 0 || string(response[2:]) != "vision-response" {
+		t.Fatalf("response=%x", response)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("VLESS without flow inbound did not stop")
+	}
+}
+
 func appendAnyTLSFrame(buffer *bytes.Buffer, command byte, streamID uint32, data []byte) {
 	header := make([]byte, anyTLSFrameHeaderSize)
 	header[0] = command

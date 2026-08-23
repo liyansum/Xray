@@ -206,8 +206,8 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	switch kind {
 	case inboundTrojan:
 		return s.processTrojan(ctx, conn, bufferedReader, user, dispatcher)
-	case inboundVLESSVision:
-		return s.processVLESSVision(ctx, conn, iConn, bufferedReader, user, dispatcher)
+	case inboundVLESS:
+		return s.processVLESS(ctx, conn, iConn, bufferedReader, user, dispatcher)
 	case inboundAnyTLS:
 		return s.processAnyTLS(ctx, conn, bufferedReader, user, dispatcher)
 	default:

@@ -33,7 +33,7 @@ type inboundProtocol byte
 const (
 	inboundUnknown inboundProtocol = iota
 	inboundTrojan
-	inboundVLESSVision
+	inboundVLESS
 	inboundAnyTLS
 )
 
@@ -122,7 +122,7 @@ func (s *Server) detectProtocol(data []byte) (inboundProtocol, *protocol.MemoryU
 		var key [16]byte
 		copy(key[:], data[1:17])
 		if user := s.multi.vless[key]; user != nil {
-			return inboundVLESSVision, user, nil
+			return inboundVLESS, user, nil
 		}
 	}
 
@@ -139,7 +139,7 @@ func (s *Server) detectProtocol(data []byte) (inboundProtocol, *protocol.MemoryU
 			}
 		}
 	}
-	return inboundUnknown, nil, errors.New("not trojan, VLESS Vision, or AnyTLS")
+	return inboundUnknown, nil, errors.New("not trojan, VLESS, or AnyTLS")
 }
 
 func (s *Server) processTrojan(ctx context.Context, conn stat.Connection, reader *buf.BufferedReader, user *protocol.MemoryUser, dispatcher routing.Dispatcher) error {
@@ -205,47 +205,47 @@ func decodeVLESSFlow(addons []byte) (string, error) {
 	return flow, nil
 }
 
-func readVLESSVisionRequest(reader io.Reader, expectedUser *protocol.MemoryUser) ([]byte, net.Destination, error) {
+func readVLESSRequest(reader io.Reader, expectedUser *protocol.MemoryUser) ([]byte, net.Destination, string, error) {
 	var fixed [17]byte
 	if _, err := io.ReadFull(reader, fixed[:]); err != nil {
-		return nil, net.Destination{}, errors.New("failed to read VLESS authentication").Base(err)
+		return nil, net.Destination{}, "", errors.New("failed to read VLESS authentication").Base(err)
 	}
 	if fixed[0] != 0 {
-		return nil, net.Destination{}, errors.New("unsupported VLESS version")
+		return nil, net.Destination{}, "", errors.New("unsupported VLESS version")
 	}
 	expectedID, _, err := userProtocolKeys(expectedUser)
 	if err != nil || !bytes.Equal(fixed[1:], expectedID[:]) {
-		return nil, net.Destination{}, errors.New("VLESS user changed during authentication")
+		return nil, net.Destination{}, "", errors.New("VLESS user changed during authentication")
 	}
 
 	var addonLength [1]byte
 	if _, err := io.ReadFull(reader, addonLength[:]); err != nil {
-		return nil, net.Destination{}, errors.New("failed to read VLESS addons length").Base(err)
+		return nil, net.Destination{}, "", errors.New("failed to read VLESS addons length").Base(err)
 	}
 	addons := make([]byte, int(addonLength[0]))
 	if _, err := io.ReadFull(reader, addons); err != nil {
-		return nil, net.Destination{}, errors.New("failed to read VLESS addons").Base(err)
+		return nil, net.Destination{}, "", errors.New("failed to read VLESS addons").Base(err)
 	}
 	flow, err := decodeVLESSFlow(addons)
 	if err != nil {
-		return nil, net.Destination{}, err
+		return nil, net.Destination{}, "", err
 	}
-	if flow != "xtls-rprx-vision" {
-		return nil, net.Destination{}, errors.New("VLESS requires flow xtls-rprx-vision")
+	if flow != "" && flow != "xtls-rprx-vision" {
+		return nil, net.Destination{}, "", errors.New("unsupported VLESS flow: ", flow)
 	}
 
 	var command [1]byte
 	if _, err := io.ReadFull(reader, command[:]); err != nil {
-		return nil, net.Destination{}, errors.New("failed to read VLESS command").Base(err)
+		return nil, net.Destination{}, "", errors.New("failed to read VLESS command").Base(err)
 	}
 	if protocol.RequestCommand(command[0]) != protocol.RequestCommandTCP {
-		return nil, net.Destination{}, errors.New("VLESS Vision inbound only accepts TCP")
+		return nil, net.Destination{}, "", errors.New("VLESS inbound only accepts TCP")
 	}
 	address, port, err := vlessAddressParser.ReadAddressPort(nil, reader)
 	if err != nil {
-		return nil, net.Destination{}, errors.New("failed to read VLESS destination").Base(err)
+		return nil, net.Destination{}, "", errors.New("failed to read VLESS destination").Base(err)
 	}
-	return append([]byte(nil), fixed[1:]...), net.TCPDestination(address, port), nil
+	return append([]byte(nil), fixed[1:]...), net.TCPDestination(address, port), flow, nil
 }
 
 func visionTLSBuffers(iConn stat.Connection) (*bytes.Reader, *bytes.Buffer, error) {
@@ -268,17 +268,21 @@ func visionTLSBuffers(iConn stat.Connection) (*bytes.Reader, *bytes.Buffer, erro
 	return input, rawInput, nil
 }
 
-func (s *Server) processVLESSVision(ctx context.Context, conn stat.Connection, iConn stat.Connection, reader *buf.BufferedReader, user *protocol.MemoryUser, dispatcher routing.Dispatcher) error {
-	userID, destination, err := readVLESSVisionRequest(reader, user)
+func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn stat.Connection, reader *buf.BufferedReader, user *protocol.MemoryUser, dispatcher routing.Dispatcher) error {
+	userID, destination, flow, err := readVLESSRequest(reader, user)
 	if err != nil {
 		return err
 	}
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
 		return errors.New("unable to clear VLESS handshake deadline").Base(err)
 	}
-	input, rawInput, err := visionTLSBuffers(iConn)
-	if err != nil {
-		return err
+	var input *bytes.Reader
+	var rawInput *bytes.Buffer
+	if flow == "xtls-rprx-vision" {
+		input, rawInput, err = visionTLSBuffers(iConn)
+		if err != nil {
+			return err
+		}
 	}
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {
@@ -286,24 +290,32 @@ func (s *Server) processVLESSVision(ctx context.Context, conn stat.Connection, i
 	}
 	inbound.Name = "vless"
 	inbound.User = user
-	inbound.CanSpliceCopy = 2
+	if flow == "xtls-rprx-vision" {
+		inbound.CanSpliceCopy = 2
+	} else {
+		inbound.CanSpliceCopy = 3
+	}
 
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From: conn.RemoteAddr(), To: destination, Status: log.AccessAccepted, Email: user.Email,
 	})
 	ctx = policy.ContextWithBufferPolicy(ctx, s.policyManager.ForLevel(user.Level).Buffer)
 
-	trafficState := proxy.NewTrafficState(userID)
-	clientReader := proxy.NewVisionReader(reader, trafficState, true, ctx, conn, input, rawInput, nil)
 	bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
 	if _, err := bufferedWriter.Write([]byte{0, 0}); err != nil {
 		return errors.New("failed to encode VLESS response header").Base(err)
 	}
-	clientWriter := proxy.NewVisionWriter(bufferedWriter, trafficState, false, ctx, conn, nil, nil)
+	var clientReader buf.Reader = reader
+	var clientWriter buf.Writer = bufferedWriter
+	if flow == "xtls-rprx-vision" {
+		trafficState := proxy.NewTrafficState(userID)
+		clientReader = proxy.NewVisionReader(reader, trafficState, true, ctx, conn, input, rawInput, nil)
+		clientWriter = proxy.NewVisionWriter(bufferedWriter, trafficState, false, ctx, conn, nil, nil)
+	}
 	bufferedWriter.SetFlushNext()
 
 	if err := dispatcher.DispatchLink(ctx, destination, &transport.Link{Reader: clientReader, Writer: clientWriter}); err != nil {
-		return errors.New("failed to dispatch VLESS Vision request").Base(err)
+		return errors.New("failed to dispatch VLESS request").Base(err)
 	}
 	return nil
 }

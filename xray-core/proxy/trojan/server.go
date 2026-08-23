@@ -36,6 +36,7 @@ func init() {
 type Server struct {
 	policyManager policy.Manager
 	validator     *Validator
+	multi         multiUserRegistry
 	fallbacks     map[string]map[string]map[string]*Fallback // or nil
 	cone          bool
 }
@@ -43,22 +44,21 @@ type Server struct {
 // NewServer creates a new trojan inbound handler.
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	validator := new(Validator)
+	v := core.MustFromContext(ctx)
+	server := &Server{
+		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+		validator:     validator,
+		multi:         newMultiUserRegistry(),
+		cone:          ctx.Value("cone").(bool),
+	}
 	for _, user := range config.Users {
 		u, err := user.ToMemoryUser()
 		if err != nil {
 			return nil, errors.New("failed to get trojan user").Base(err).AtError()
 		}
-
-		if err := validator.Add(u); err != nil {
+		if err := server.addUser(u); err != nil {
 			return nil, errors.New("failed to add user").Base(err).AtError()
 		}
-	}
-
-	v := core.MustFromContext(ctx)
-	server := &Server{
-		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		validator:     validator,
-		cone:          ctx.Value("cone").(bool),
 	}
 
 	if config.Fallbacks != nil {
@@ -116,12 +116,12 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 
 // AddUser implements proxy.UserManager.AddUser().
 func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
-	return s.validator.Add(u)
+	return s.addUser(u)
 }
 
 // RemoveUser implements proxy.UserManager.RemoveUser().
 func (s *Server) RemoveUser(ctx context.Context, e string) error {
-	return s.validator.Del(e)
+	return s.removeUser(e)
 }
 
 // GetUser implements proxy.UserManager.GetUser().
@@ -154,19 +154,22 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	}
 
 	first := buf.New()
-	firstLen, err := first.ReadFrom(conn)
-	if err != nil {
-		first.Release()
-		return errors.New("failed to read first request").Base(err)
-	}
-	for firstLen < userHashCRLF && isTrojanUserHashPrefix(first.Bytes()) {
-		n, err := first.ReadFrom(conn)
+	var firstLen int64
+	var kind inboundProtocol
+	var user *protocol.MemoryUser
+	var err error
+	for {
+		n, readErr := first.ReadFrom(conn)
 		firstLen += n
-		if err != nil {
+		if readErr != nil {
 			first.Release()
-			return errors.New("failed to read fragmented request header").Base(err)
+			return errors.New("failed to read first request").Base(readErr)
 		}
-		if n == 0 {
+		kind, user, err = s.detectProtocol(first.Bytes())
+		if err == nil || err != errNeedMoreData {
+			break
+		}
+		if n == 0 || first.IsFull() {
 			first.Release()
 			return errors.New("failed to read fragmented request header: no progress")
 		}
@@ -181,15 +184,10 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		bufferedReader.Buffer = nil
 	}()
 
-	var user *protocol.MemoryUser
-
 	napfb := s.fallbacks
 	isfb := napfb != nil
-
-	shouldFallback := false
-	if firstLen < userHashCRLF || first.Byte(userHashSize) != '\r' || first.Byte(userHashSize+1) != '\n' {
-		// invalid protocol
-		err = errors.New("not trojan protocol")
+	shouldFallback := err != nil
+	if shouldFallback {
 		log.Record(&log.AccessMessage{
 			From:   conn.RemoteAddr(),
 			To:     "",
@@ -197,21 +195,6 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			Reason: err,
 		})
 
-		shouldFallback = true
-	} else {
-		user = s.validator.Get(string(first.BytesTo(userHashSize)))
-		if user == nil {
-			// invalid user, let's fallback
-			err = errors.New("not a valid user")
-			log.Record(&log.AccessMessage{
-				From:   conn.RemoteAddr(),
-				To:     "",
-				Status: log.AccessRejected,
-				Reason: err,
-			})
-
-			shouldFallback = true
-		}
 	}
 
 	if isfb && shouldFallback {
@@ -220,41 +203,16 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		return errors.New("invalid protocol or invalid user")
 	}
 
-	clientReader := &ConnReader{Reader: bufferedReader}
-	if err := clientReader.ParseHeader(); err != nil {
-		log.Record(&log.AccessMessage{
-			From:   conn.RemoteAddr(),
-			To:     "",
-			Status: log.AccessRejected,
-			Reason: err,
-		})
-		return errors.New("failed to create request from: ", conn.RemoteAddr()).Base(err)
+	switch kind {
+	case inboundTrojan:
+		return s.processTrojan(ctx, conn, bufferedReader, user, dispatcher)
+	case inboundVLESSVision:
+		return s.processVLESSVision(ctx, conn, iConn, bufferedReader, user, dispatcher)
+	case inboundAnyTLS:
+		return s.processAnyTLS(ctx, conn, bufferedReader, user, dispatcher)
+	default:
+		return errors.New("invalid protocol or invalid user")
 	}
-
-	destination := clientReader.Target
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return errors.New("unable to set read deadline").Base(err).AtWarning()
-	}
-
-	inbound := session.InboundFromContext(ctx)
-	inbound.Name = "trojan"
-	inbound.CanSpliceCopy = 3
-	inbound.User = user
-	sessionPolicy = s.policyManager.ForLevel(user.Level)
-
-	if destination.Network == net.Network_UDP { // handle udp request
-		return s.handleUDPPayload(ctx, sessionPolicy, &PacketReader{Reader: clientReader}, &PacketWriter{Writer: conn}, dispatcher)
-	}
-
-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
-		From:   conn.RemoteAddr(),
-		To:     destination,
-		Status: log.AccessAccepted,
-		Reason: "",
-		Email:  user.Email,
-	})
-
-	return s.handleConnection(ctx, sessionPolicy, destination, clientReader, buf.NewWriter(conn), dispatcher)
 }
 
 func isTrojanUserHashPrefix(data []byte) bool {
@@ -355,6 +313,15 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 	clientReader buf.Reader,
 	clientWriter buf.Writer, dispatcher routing.Dispatcher,
 ) error {
+	return s.handleConnectionAfterDispatch(ctx, sessionPolicy, destination, clientReader, clientWriter, dispatcher, nil)
+}
+
+func (s *Server) handleConnectionAfterDispatch(ctx context.Context, sessionPolicy policy.Session,
+	destination net.Destination,
+	clientReader buf.Reader,
+	clientWriter buf.Writer, dispatcher routing.Dispatcher,
+	afterDispatch func(error) error,
+) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
@@ -363,7 +330,17 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 
 	link, err := dispatcher.Dispatch(ctx, destination)
 	if err != nil {
+		if afterDispatch != nil {
+			_ = afterDispatch(err)
+		}
 		return errors.New("failed to dispatch request to ", destination).Base(err)
+	}
+	if afterDispatch != nil {
+		if err := afterDispatch(nil); err != nil {
+			common.Must(common.Interrupt(link.Reader))
+			common.Must(common.Interrupt(link.Writer))
+			return errors.New("failed to report dispatched request").Base(err)
+		}
 	}
 
 	requestDone := func() error {

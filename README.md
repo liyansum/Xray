@@ -55,6 +55,7 @@ termination is not required.
 
 The default build is a static Linux amd64 binary compiled with:
 
+- Go `1.26.7`
 - `CGO_ENABLED=0`
 - `GOAMD64=v3`
 - `-trimpath`

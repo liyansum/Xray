@@ -16,7 +16,7 @@
 - 普通 Trojan 节点的同一个 TCP + TLS 端口可同时接受 Trojan、VLESS 和 AnyTLS。
 - 支持 VLESS + TCP + TLS 空 flow。
 - 支持 VLESS + TCP + TLS + `xtls-rprx-vision`，Vision 要求外层 TLS 1.3。
-- 支持 AnyTLS v2 多路复用、SYNACK、心跳及 UDP-over-TCP v2。
+- 支持 AnyTLS v1/v2 多路复用；v2 额外支持 SYNACK、心跳及服务端版本协商。
 - AnyTLS UDP 支持 connect 和非 connect 模式，并复用 Xray 的 UDP dispatcher。
 - 三种协议使用面板下发的同一个 UUID，保留用户热更新、流量统计、在线设备限制、用户限速和路由规则。
 - 未通过认证的连接继续使用 Trojan 原有 fallback，保留 SNI、ALPN、HTTP path 和 PROXY protocol 选择行为。
@@ -35,13 +35,15 @@
 | Trojan | TCP + TLS | UUID 字符串作为密码 |
 | VLESS | TCP + TLS，空 flow | 同一 UUID 的 16 字节形式 |
 | VLESS Vision | TCP + TLS 1.3，`xtls-rprx-vision` | 同一 UUID 的 16 字节形式 |
-| AnyTLS | AnyTLS v2 + TLS | `SHA-256(UUID 字符串)`，由客户端自动计算 |
+| AnyTLS | AnyTLS v1 或 v2 + TLS | `SHA-256(UUID 字符串)`，由客户端自动计算 |
 
 协议识别发生在现有 TLS listener 完成握手后，不会修改证书、SNI、ALPN、cipher suites、TLS 版本策略或后量子协商。
 
+未匹配完整有效凭据的连接不会收到多协议特有响应，原始应用层字节会完整交给 Trojan fallback。协议检测不会根据已登记用户的 VLESS UUID 或 AnyTLS 哈希前缀延长等待，避免形成可逐字节试探用户凭据的时序 oracle。只有已经提供完整有效 AnyTLS 凭据的客户端才会进入版本协商；此后的非法设置会在加密连接内收到 AnyTLS Alert 并关闭，不会把已认证协议头转发给伪装站点。
+
 普通 VLESS 空 flow 不使用 Vision padding，因此代理 HTTPS 时仍具有普通 VLESS TLS-in-TLS 的流量特征；这不会改变 Trojan、AnyTLS、Vision 或 fallback 的行为。VLESS 仅开放 TCP 请求，其他 flow、VLESS UDP 和 VLESS Mux 不受支持。
 
-AnyTLS 仅接受协议版本 2。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。UDP 使用 AnyTLS 规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
+AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
 
 ## 面板与节点配置
 
@@ -53,7 +55,7 @@ AnyTLS 仅接受协议版本 2。每条复用 stream 都使用独立路由上下
 2. 用户信息继续由面板下发 UUID，不需要为不同协议创建多份用户。
 3. XrayR 中使用 `PanelType: "NewV2board"` 和 `NodeType: Trojan`。
 4. 配置本地 TLS 证书和私钥；多协议入口依赖该 Trojan TLS listener。
-5. 客户端根据需要选择 Trojan、VLESS 空 flow、VLESS Vision 或 AnyTLS v2，服务器地址、端口、SNI 和 UUID 保持一致。
+5. 客户端根据需要选择 Trojan、VLESS 空 flow、VLESS Vision 或 AnyTLS v1/v2，服务器地址、端口、SNI 和 UUID 保持一致。
 
 示例配置：
 
@@ -146,7 +148,7 @@ Nodes:
 | XrayR 服务 | `https://github.com/liyansum/XrayR` | `master` | `a9df56584ebd97b68e6987fcf2cd207cbbc27d3f` |
 | 专用 Xray-core | `https://github.com/liyansum/Xray-core` | `main` | `f5b4e833af34694c4b936629591c52c7c49cef91` |
 
-Vision 数据路径来自 MPL-2.0 的 Xray-core。AnyTLS v2 和 UoT v2 依据 AnyTLS 官方协议、sing-box UoT 格式及 mihomo 的兼容行为在本项目内实现，没有增加新的运行时依赖。
+Vision 数据路径来自 MPL-2.0 的 Xray-core。AnyTLS v1/v2 和 UoT v2 依据 AnyTLS 官方协议、sing-box UoT 格式及 mihomo 的兼容行为在本项目内实现，没有增加新的运行时依赖。
 
 ## 编译
 

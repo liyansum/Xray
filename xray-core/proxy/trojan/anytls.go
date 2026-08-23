@@ -192,8 +192,10 @@ func (s *anyTLSServerSession) run() error {
 					stream.closeRemote()
 				}
 			case anyTLSCmdHeartRequest:
-				if err := s.writeFrame(anyTLSCmdHeartResponse, streamID, nil); err != nil {
-					return err
+				if s.peerVersion >= 2 {
+					if err := s.writeFrame(anyTLSCmdHeartResponse, streamID, nil); err != nil {
+						return err
+					}
 				}
 			case anyTLSCmdHeartResponse:
 				// Receiving it is itself activity; no further state is needed server-side.
@@ -220,10 +222,13 @@ func parseAnyTLSSettings(data []byte) map[string]string {
 }
 
 func (s *anyTLSServerSession) handleSettings(data []byte) error {
+	if s.receivedSettings {
+		return errors.New("duplicate AnyTLS settings")
+	}
 	settings := parseAnyTLSSettings(data)
 	version, err := strconv.Atoi(settings["v"])
-	if err != nil || version < 2 {
-		return errors.New("AnyTLS v2 is required")
+	if err != nil || version < 1 {
+		return errors.New("invalid AnyTLS protocol version")
 	}
 	s.peerVersion = version
 	s.receivedSettings = true
@@ -232,7 +237,10 @@ func (s *anyTLSServerSession) handleSettings(data []byte) error {
 			return err
 		}
 	}
-	return s.writeFrame(anyTLSCmdServerSetting, 0, []byte("v=2"))
+	if version >= 2 {
+		return s.writeFrame(anyTLSCmdServerSetting, 0, []byte("v=2"))
+	}
+	return nil
 }
 
 func (s *anyTLSServerSession) openStream(id uint32) {
@@ -363,7 +371,9 @@ func (s *anyTLSStream) closeRemote() {
 func (s *anyTLSStream) handshakeSuccess() error {
 	var reportErr error
 	s.report.Do(func() {
-		reportErr = s.session.writeFrame(anyTLSCmdSYNACK, s.id, nil)
+		if s.session.peerVersion >= 2 {
+			reportErr = s.session.writeFrame(anyTLSCmdSYNACK, s.id, nil)
+		}
 	})
 	return reportErr
 }
@@ -371,7 +381,9 @@ func (s *anyTLSStream) handshakeSuccess() error {
 func (s *anyTLSStream) handshakeFailure(err error) error {
 	var reportErr error
 	s.report.Do(func() {
-		reportErr = s.session.writeFrame(anyTLSCmdSYNACK, s.id, []byte(err.Error()))
+		if s.session.peerVersion >= 2 {
+			reportErr = s.session.writeFrame(anyTLSCmdSYNACK, s.id, []byte(err.Error()))
+		}
 	})
 	return reportErr
 }

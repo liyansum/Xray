@@ -59,17 +59,27 @@ func TestMultiProtocolAuthentication(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			for split := 1; split < len(test.credential); split++ {
-				kind, gotUser, err := server.detectProtocol(test.credential[:split])
-				if err != errNeedMoreData {
-					t.Fatalf("split %d: expected more data, got kind=%d user=%v err=%v", split, kind, gotUser, err)
-				}
-			}
 			kind, gotUser, err := server.detectProtocol(test.credential)
 			if err != nil || kind != test.kind || gotUser != user {
 				t.Fatalf("kind=%d user=%v err=%v", kind, gotUser, err)
 			}
 		})
+	}
+	for split := 1; split < len(trojanCredential); split++ {
+		kind, gotUser, err := server.detectProtocol(trojanCredential[:split])
+		if err != errNeedMoreData {
+			t.Fatalf("fragmented Trojan split %d: expected more data, got kind=%d user=%v err=%v", split, kind, gotUser, err)
+		}
+	}
+
+	for name, probe := range map[string][]byte{
+		"matching AnyTLS hash prefix": anyTLSCredential[:16],
+		"unrelated binary prefix":     {0xff, 0x7f, 0x10, 0x80},
+		"VLESS-looking prefix":        vlessCredential[:16],
+	} {
+		if _, gotUser, err := server.detectProtocol(probe); err == nil || err == errNeedMoreData || gotUser != nil {
+			t.Fatalf("%s exposed a credential-dependent wait: user=%v err=%v", name, gotUser, err)
+		}
 	}
 
 	if _, _, err := server.detectProtocol([]byte("GET / HTTP/1.1\r\n")); err == nil || err == errNeedMoreData {
@@ -208,6 +218,47 @@ func TestAnyTLSV2Session(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("AnyTLS server session did not stop")
+	}
+}
+
+func TestAnyTLSV1Session(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer clientConn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session := newAnyTLSServerSession(ctx, serverConn, serverConn, testActivity{}, func(stream *anyTLSStream) {
+		if err := stream.handshakeSuccess(); err != nil {
+			return
+		}
+		payload := make([]byte, 4)
+		if _, err := io.ReadFull(stream, payload); err == nil && bytes.Equal(payload, []byte("ping")) {
+			_, _ = stream.Write([]byte("pong"))
+		}
+	})
+	done := make(chan error, 1)
+	go func() { done <- session.run() }()
+
+	settings := []byte("v=1\nclient=xray-test\npadding-md5=" + anyTLSPaddingMD5)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSettings, 0, settings)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdHeartRequest, 0, nil)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, 1, nil)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdPSH, 1, []byte("ping"))
+
+	command, streamID, data := readTestAnyTLSFrame(t, clientConn)
+	if command != anyTLSCmdPSH || streamID != 1 || string(data) != "pong" {
+		t.Fatalf("v1 received a v2 control frame or bad payload: command=%d stream=%d data=%q", command, streamID, data)
+	}
+	command, streamID, _ = readTestAnyTLSFrame(t, clientConn)
+	if command != anyTLSCmdFIN || streamID != 1 {
+		t.Fatalf("unexpected FIN: command=%d stream=%d", command, streamID)
+	}
+
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AnyTLS v1 server session did not stop")
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math/big"
 	stdnet "net"
@@ -257,7 +258,7 @@ func appendAnyTLSFrame(buffer *bytes.Buffer, command byte, streamID uint32, data
 	buffer.Write(data)
 }
 
-func TestAnyTLSV2OverExistingTLS(t *testing.T) {
+func testAnyTLSOverExistingTLS(t *testing.T, version int) {
 	server, user := testMultiServer(t)
 	server.policyManager = &testPolicyManager{}
 	dispatcher := &anyTLSTestDispatcher{received: make(chan []byte, 1), metadata: make(chan *session.Inbound, 1)}
@@ -285,13 +286,19 @@ func TestAnyTLSV2OverExistingTLS(t *testing.T) {
 	var authentication bytes.Buffer
 	authentication.Write(hash[:])
 	authentication.Write([]byte{0, 0})
-	appendAnyTLSFrame(&authentication, anyTLSCmdSettings, 0, []byte("v=2\nclient=xray-test\npadding-md5="+anyTLSPaddingMD5))
 	if _, err := clientTLS.Write(authentication.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	command, _, data := readTestAnyTLSFrame(t, clientTLS)
-	if command != anyTLSCmdServerSetting || string(data) != "v=2" {
-		t.Fatalf("unexpected settings response: command=%d data=%q", command, data)
+	var settings bytes.Buffer
+	appendAnyTLSFrame(&settings, anyTLSCmdSettings, 0, []byte(fmt.Sprintf("v=%d\nclient=xray-test\npadding-md5=%s", version, anyTLSPaddingMD5)))
+	if _, err := clientTLS.Write(settings.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if version >= 2 {
+		command, _, data := readTestAnyTLSFrame(t, clientTLS)
+		if command != anyTLSCmdServerSetting || string(data) != "v=2" {
+			t.Fatalf("unexpected settings response: command=%d data=%q", command, data)
+		}
 	}
 
 	var streamRequest bytes.Buffer
@@ -305,11 +312,13 @@ func TestAnyTLSV2OverExistingTLS(t *testing.T) {
 	if _, err := clientTLS.Write(streamFrames.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	command, streamID, _ := readTestAnyTLSFrame(t, clientTLS)
-	if command != anyTLSCmdSYNACK || streamID != 1 {
-		t.Fatalf("unexpected SYNACK: command=%d stream=%d", command, streamID)
+	if version >= 2 {
+		command, streamID, _ := readTestAnyTLSFrame(t, clientTLS)
+		if command != anyTLSCmdSYNACK || streamID != 1 {
+			t.Fatalf("unexpected SYNACK: command=%d stream=%d", command, streamID)
+		}
 	}
-	command, streamID, data = readTestAnyTLSFrame(t, clientTLS)
+	command, streamID, data := readTestAnyTLSFrame(t, clientTLS)
 	if command != anyTLSCmdPSH || streamID != 1 || string(data) != "anytls-response" {
 		t.Fatalf("unexpected response: command=%d stream=%d data=%q", command, streamID, data)
 	}
@@ -339,7 +348,11 @@ func TestAnyTLSV2OverExistingTLS(t *testing.T) {
 	}
 }
 
-func TestAnyTLSV2UoTOverExistingTLS(t *testing.T) {
+func TestAnyTLSV1OverExistingTLS(t *testing.T) { testAnyTLSOverExistingTLS(t, 1) }
+
+func TestAnyTLSV2OverExistingTLS(t *testing.T) { testAnyTLSOverExistingTLS(t, 2) }
+
+func testAnyTLSUoTOverExistingTLS(t *testing.T, version int) {
 	server, _ := testMultiServer(t)
 	server.policyManager = &testPolicyManager{}
 	dispatcher := &anyTLSTestDispatcher{received: make(chan []byte, 1), metadata: make(chan *session.Inbound, 1)}
@@ -364,12 +377,18 @@ func TestAnyTLSV2UoTOverExistingTLS(t *testing.T) {
 	var authentication bytes.Buffer
 	authentication.Write(hash[:])
 	authentication.Write([]byte{0, 0})
-	appendAnyTLSFrame(&authentication, anyTLSCmdSettings, 0, []byte("v=2\nclient=xray-test\npadding-md5="+anyTLSPaddingMD5))
 	if _, err := clientTLS.Write(authentication.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	if command, _, _ := readTestAnyTLSFrame(t, clientTLS); command != anyTLSCmdServerSetting {
-		t.Fatalf("settings command=%d", command)
+	var settings bytes.Buffer
+	appendAnyTLSFrame(&settings, anyTLSCmdSettings, 0, []byte(fmt.Sprintf("v=%d\nclient=xray-test\npadding-md5=%s", version, anyTLSPaddingMD5)))
+	if _, err := clientTLS.Write(settings.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if version >= 2 {
+		if command, _, _ := readTestAnyTLSFrame(t, clientTLS); command != anyTLSCmdServerSetting {
+			t.Fatalf("settings command=%d", command)
+		}
 	}
 
 	var streamRequest bytes.Buffer
@@ -388,9 +407,11 @@ func TestAnyTLSV2UoTOverExistingTLS(t *testing.T) {
 	if _, err := clientTLS.Write(streamFrames.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	command, streamID, _ := readTestAnyTLSFrame(t, clientTLS)
-	if command != anyTLSCmdSYNACK || streamID != 1 {
-		t.Fatalf("unexpected UoT SYNACK: command=%d stream=%d", command, streamID)
+	if version >= 2 {
+		command, streamID, _ := readTestAnyTLSFrame(t, clientTLS)
+		if command != anyTLSCmdSYNACK || streamID != 1 {
+			t.Fatalf("unexpected UoT SYNACK: command=%d stream=%d", command, streamID)
+		}
 	}
 	command, streamID, data := readTestAnyTLSFrame(t, clientTLS)
 	if command != anyTLSCmdPSH || streamID != 1 || len(data) < 2 {
@@ -415,5 +436,122 @@ func TestAnyTLSV2UoTOverExistingTLS(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("AnyTLS UoT inbound did not stop")
+	}
+}
+
+func TestAnyTLSV1UoTOverExistingTLS(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 1) }
+
+func TestAnyTLSV2UoTOverExistingTLS(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 2) }
+
+func testMultiProtocolFallback(t *testing.T, payload []byte) {
+	t.Helper()
+	listener, err := stdnet.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	backendPayload := make(chan []byte, 1)
+	backendDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			backendDone <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		received := make([]byte, len(payload))
+		if _, err := io.ReadFull(conn, received); err != nil {
+			backendDone <- err
+			return
+		}
+		backendPayload <- received
+		_, err = conn.Write([]byte("fallback-response"))
+		backendDone <- err
+	}()
+
+	server, _ := testMultiServer(t)
+	server.policyManager = &testPolicyManager{}
+	server.fallbacks = map[string]map[string]map[string]*Fallback{
+		"": {"": {"": {Type: "tcp", Dest: listener.Addr().String()}}},
+	}
+
+	serverRaw, clientRaw := stdnet.Pipe()
+	serverTLS := xraytls.Server(serverRaw, &gotls.Config{
+		Certificates: []gotls.Certificate{testTLSCertificate(t)}, MinVersion: gotls.VersionTLS13, MaxVersion: gotls.VersionTLS13,
+	}).(*xraytls.Conn)
+	clientTLS := gotls.Client(clientRaw, &gotls.Config{
+		InsecureSkipVerify: true, ServerName: "localhost", MinVersion: gotls.VersionTLS13, MaxVersion: gotls.VersionTLS13,
+	})
+	defer clientTLS.Close()
+	defer serverTLS.Close()
+	_ = clientTLS.SetDeadline(time.Now().Add(3 * time.Second))
+
+	ctx := session.ContextWithInbound(context.Background(), &session.Inbound{
+		Source: net.TCPDestination(net.LocalHostIP, 45678), Local: net.TCPDestination(net.LocalHostIP, 443), Conn: serverTLS,
+	})
+	processDone := make(chan error, 1)
+	go func() { processDone <- server.Process(ctx, net.Network_TCP, serverTLS, &anyTLSTestDispatcher{}) }()
+
+	if _, err := clientTLS.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, len("fallback-response"))
+	if _, err := io.ReadFull(clientTLS, response); err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != "fallback-response" {
+		t.Fatalf("unexpected fallback response %q", response)
+	}
+	select {
+	case received := <-backendPayload:
+		if !bytes.Equal(received, payload) {
+			t.Fatalf("fallback changed probe payload: got=%x want=%x", received, payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fallback backend did not receive probe")
+	}
+	select {
+	case err := <-backendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fallback backend did not finish")
+	}
+
+	_ = clientTLS.Close()
+	select {
+	case <-processDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("fallback processing did not stop")
+	}
+}
+
+func TestMultiProtocolHTTPProbeUsesFallback(t *testing.T) {
+	testMultiProtocolFallback(t, []byte("GET /probe HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
+}
+
+func TestFailedMultiProtocolAuthenticationUsesFallback(t *testing.T) {
+	wrongHash := sha256.Sum256([]byte("not-a-valid-user"))
+	var anyTLSPayload bytes.Buffer
+	anyTLSPayload.Write(wrongHash[:])
+	anyTLSPayload.Write([]byte{0, 0})
+	appendAnyTLSFrame(&anyTLSPayload, anyTLSCmdSettings, 0, []byte("v=1\nclient=active-probe"))
+
+	vlessPayload := append([]byte{0}, make([]byte, 16)...)
+	vlessPayload = append(vlessPayload, []byte("invalid-vless-probe")...)
+	trojanPayload := append(bytes.Repeat([]byte{'0'}, userHashSize), '\r', '\n')
+	trojanPayload = append(trojanPayload, []byte("invalid-trojan-probe")...)
+
+	for name, payload := range map[string][]byte{
+		"AnyTLS": anyTLSPayload.Bytes(),
+		"VLESS":  vlessPayload,
+		"Trojan": trojanPayload,
+	} {
+		t.Run(name, func(t *testing.T) {
+			testMultiProtocolFallback(t, payload)
+		})
 	}
 }

@@ -129,16 +129,11 @@ func (s *Server) detectProtocol(data []byte) (inboundProtocol, *protocol.MemoryU
 	if len(data) < userHashCRLF && isTrojanUserHashPrefix(data) {
 		return inboundUnknown, nil, errNeedMoreData
 	}
-	if len(data) < 17 && (len(data) == 0 || data[0] == 0) {
-		return inboundUnknown, nil, errNeedMoreData
-	}
-	if len(data) < sha256.Size {
-		for key := range s.multi.anytls {
-			if bytes.Equal(data, key[:len(data)]) {
-				return inboundUnknown, nil, errNeedMoreData
-			}
-		}
-	}
+	// Do not wait based on a registered VLESS or AnyTLS credential prefix. Apart
+	// from exposing a user-specific timing oracle, doing so would make arbitrary
+	// active probes behave differently from the original Trojan fallback. Both
+	// binary protocols send their complete authentication discriminator in the
+	// initial TLS application write.
 	return inboundUnknown, nil, errors.New("not trojan, VLESS, or AnyTLS")
 }
 

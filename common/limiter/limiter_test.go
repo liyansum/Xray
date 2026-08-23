@@ -1,13 +1,16 @@
 package limiter
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/liyansum/Xray/api"
+	"github.com/xtls/xray-core/common/buf"
 	"golang.org/x/time/rate"
 )
 
@@ -145,6 +148,52 @@ func TestConcurrentDeviceAdmissionDoesNotExceedLimit(t *testing.T) {
 	wg.Wait()
 	if got := accepted.Load(); got != deviceLimit {
 		t.Fatalf("accepted %d devices, want %d", got, deviceLimit)
+	}
+}
+
+func TestRateReaderSplitsWithoutLosingData(t *testing.T) {
+	payload := []byte("0123456789")
+	reader := New().RateReader(context.Background(), buf.NewReader(bytes.NewReader(payload)), rate.NewLimiter(rate.Inf, 4))
+	var received []byte
+	var chunkSizes []int32
+	for {
+		mb, err := reader.ReadMultiBuffer()
+		if !mb.IsEmpty() {
+			chunkSizes = append(chunkSizes, mb.Len())
+			chunk := make([]byte, mb.Len())
+			mb.Copy(chunk)
+			received = append(received, chunk...)
+			buf.ReleaseMulti(mb)
+		}
+		if err != nil {
+			if err != io.EOF {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("rate reader changed payload: got %q want %q", received, payload)
+	}
+	if fmt.Sprint(chunkSizes) != "[4 4 2]" {
+		t.Fatalf("unexpected rate-limited chunks: %v", chunkSizes)
+	}
+}
+
+func TestUserRateBucketIsSharedAcrossConnections(t *testing.T) {
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com", SpeedLimit: 1024}}
+	limiter := New()
+	if err := limiter.AddInboundLimiter("node", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	email := "node|user@example.com|1"
+	first, limited, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true)
+	if reject || !limited || first == nil {
+		t.Fatalf("first bucket: limited=%v reject=%v bucket=%v", limited, reject, first)
+	}
+	second, limited, reject := limiter.GetUserBucket("node", email, "192.0.2.2", true)
+	if reject || !limited || second != first {
+		t.Fatalf("second connection did not share the user bucket: limited=%v reject=%v", limited, reject)
 	}
 }
 

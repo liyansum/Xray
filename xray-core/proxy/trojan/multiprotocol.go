@@ -73,17 +73,22 @@ func (s *Server) addUser(user *protocol.MemoryUser) error {
 	if err != nil {
 		return err
 	}
+	s.multi.mu.Lock()
+	defer s.multi.mu.Unlock()
+	if s.multi.vless[vlessKey] != nil || s.multi.anytls[anyTLSKey] != nil {
+		return errors.New("multi-protocol user UUID already exists")
+	}
 	if err := s.validator.Add(user); err != nil {
 		return err
 	}
-	s.multi.mu.Lock()
 	s.multi.vless[vlessKey] = user
 	s.multi.anytls[anyTLSKey] = user
-	s.multi.mu.Unlock()
 	return nil
 }
 
 func (s *Server) removeUser(email string) error {
+	s.multi.mu.Lock()
+	defer s.multi.mu.Unlock()
 	user := s.validator.GetByEmail(email)
 	if user == nil {
 		return s.validator.Del(email)
@@ -95,10 +100,8 @@ func (s *Server) removeUser(email string) error {
 	if err := s.validator.Del(email); err != nil {
 		return err
 	}
-	s.multi.mu.Lock()
 	delete(s.multi.vless, vlessKey)
 	delete(s.multi.anytls, anyTLSKey)
-	s.multi.mu.Unlock()
 	return nil
 }
 

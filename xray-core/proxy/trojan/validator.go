@@ -23,7 +23,13 @@ func (v *Validator) Add(u *protocol.MemoryUser) error {
 			return errors.New("User ", u.Email, " already exists.")
 		}
 	}
-	v.users.Store(string(u.Account.(*MemoryAccount).Key), u)
+	_, loaded := v.users.LoadOrStore(string(u.Account.(*MemoryAccount).Key), u)
+	if loaded {
+		if u.Email != "" {
+			v.email.Delete(strings.ToLower(u.Email))
+		}
+		return errors.New("User credential already exists.")
+	}
 	return nil
 }
 

@@ -19,13 +19,20 @@ import (
 
 const testUUID = "550e8400-e29b-41d4-a716-446655440000"
 
+const secondTestUUID = "7d9e5f26-75e4-4f7e-9c49-2b8d619cdb93"
+
 func testMultiUser(t testing.TB) *protocol.MemoryUser {
 	t.Helper()
-	account, err := (&Account{Password: testUUID}).AsAccount()
+	return testMultiUserWithCredentials(t, testUUID, "multi@example.com")
+}
+
+func testMultiUserWithCredentials(t testing.TB, password, email string) *protocol.MemoryUser {
+	t.Helper()
+	account, err := (&Account{Password: password}).AsAccount()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &protocol.MemoryUser{Email: "multi@example.com", Level: 1, Account: account}
+	return &protocol.MemoryUser{Email: email, Level: 1, Account: account}
 }
 
 func testMultiServer(t testing.TB) (*Server, *protocol.MemoryUser) {
@@ -102,6 +109,135 @@ func TestMultiProtocolDynamicUserUpdate(t *testing.T) {
 	}
 	if kind, gotUser, err := server.detectProtocol(credential[:]); err != nil || kind != inboundAnyTLS || gotUser != user {
 		t.Fatalf("re-added AnyTLS user was not accepted: kind=%d user=%v err=%v", kind, gotUser, err)
+	}
+}
+
+func TestMultiProtocolAuthenticationSeparatesUsers(t *testing.T) {
+	server := &Server{validator: new(Validator), multi: newMultiUserRegistry()}
+	users := []*protocol.MemoryUser{
+		testMultiUserWithCredentials(t, testUUID, "first@example.com"),
+		testMultiUserWithCredentials(t, secondTestUUID, "second@example.com"),
+	}
+	for _, user := range users {
+		if err := server.addUser(user); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, user := range users {
+		vlessID, anyTLSHash, err := userProtocolKeys(user)
+		if err != nil {
+			t.Fatal(err)
+		}
+		credentials := []struct {
+			kind inboundProtocol
+			data []byte
+		}{
+			{kind: inboundTrojan, data: append(append([]byte(nil), user.Account.(*MemoryAccount).Key...), '\r', '\n')},
+			{kind: inboundVLESS, data: append([]byte{0}, vlessID[:]...)},
+			{kind: inboundAnyTLS, data: anyTLSHash[:]},
+		}
+		for _, credential := range credentials {
+			kind, authenticated, err := server.detectProtocol(credential.data)
+			if err != nil || kind != credential.kind || authenticated != user {
+				t.Fatalf("email=%s kind=%d authenticated=%v err=%v", user.Email, kind, authenticated, err)
+			}
+		}
+	}
+
+	unknown := testMultiUserWithCredentials(t, "c5d92df3-b90a-4adb-94d6-818a28bff9c0", "unknown@example.com")
+	unknownVLESS, unknownAnyTLS, err := userProtocolKeys(unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, credential := range map[string][]byte{
+		"trojan": append(append([]byte(nil), unknown.Account.(*MemoryAccount).Key...), '\r', '\n'),
+		"vless":  append([]byte{0}, unknownVLESS[:]...),
+		"anytls": unknownAnyTLS[:],
+	} {
+		if _, authenticated, err := server.detectProtocol(credential); err == nil || authenticated != nil {
+			t.Fatalf("unknown %s credential was accepted as %v", name, authenticated)
+		}
+	}
+}
+
+func TestMultiProtocolRejectsDuplicateUUID(t *testing.T) {
+	server := &Server{validator: new(Validator), multi: newMultiUserRegistry()}
+	first := testMultiUserWithCredentials(t, testUUID, "first@example.com")
+	// UUID parsing is case-insensitive for VLESS, so a differently formatted
+	// password must not overwrite the first user's normalized VLESS identity.
+	duplicate := testMultiUserWithCredentials(t, strings.ToUpper(testUUID), "duplicate@example.com")
+	if err := server.addUser(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.addUser(duplicate); err == nil {
+		t.Fatal("the same UUID was assigned to two users")
+	}
+
+	vlessID, anyTLSHash, err := userProtocolKeys(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range [][]byte{
+		append(append([]byte(nil), first.Account.(*MemoryAccount).Key...), '\r', '\n'),
+		append([]byte{0}, vlessID[:]...),
+		anyTLSHash[:],
+	} {
+		_, authenticated, err := server.detectProtocol(credential)
+		if err != nil || authenticated != first {
+			t.Fatalf("duplicate UUID changed credential ownership: user=%v err=%v", authenticated, err)
+		}
+	}
+	if server.validator.GetByEmail(duplicate.Email) != nil {
+		t.Fatal("rejected duplicate user remained registered by email")
+	}
+}
+
+func TestMultiProtocolAuthenticationDuringUserUpdates(t *testing.T) {
+	server := &Server{validator: new(Validator), multi: newMultiUserRegistry()}
+	stable := testMultiUserWithCredentials(t, testUUID, "stable@example.com")
+	rotating := testMultiUserWithCredentials(t, secondTestUUID, "rotating@example.com")
+	if err := server.addUser(stable); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.addUser(rotating); err != nil {
+		t.Fatal(err)
+	}
+	stableVLESS, stableAnyTLS, err := userProtocolKeys(stable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := [][]byte{
+		append(append([]byte(nil), stable.Account.(*MemoryAccount).Key...), '\r', '\n'),
+		append([]byte{0}, stableVLESS[:]...),
+		stableAnyTLS[:],
+	}
+
+	updates := make(chan error, 1)
+	go func() {
+		for range 1_000 {
+			if err := server.removeUser(rotating.Email); err != nil {
+				updates <- err
+				return
+			}
+			if err := server.addUser(rotating); err != nil {
+				updates <- err
+				return
+			}
+		}
+		updates <- nil
+	}()
+
+	for range 5_000 {
+		for _, credential := range credentials {
+			_, authenticated, err := server.detectProtocol(credential)
+			if err != nil || authenticated != stable {
+				t.Fatalf("stable credential changed during another user update: user=%v err=%v", authenticated, err)
+			}
+		}
+	}
+	if err := <-updates; err != nil {
+		t.Fatal(err)
 	}
 }
 

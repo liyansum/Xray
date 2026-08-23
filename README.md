@@ -52,7 +52,7 @@ AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1
 配合 [liyansum/v2board](https://github.com/liyansum/v2board) 使用时：
 
 1. 在面板中创建普通 Trojan 节点，配置节点端口和域名。
-2. 用户信息继续由面板下发 UUID，不需要为不同协议创建多份用户。
+2. 用户信息继续由面板下发 UUID，不需要为不同协议创建多份用户；不同用户必须使用不同 UUID，重复 UUID（包括仅大小写不同的写法）会被拒绝，避免认证和流量归属被覆盖。
 3. XrayR 中使用 `PanelType: "NewV2board"` 和 `NodeType: Trojan`。
 4. 配置本地 TLS 证书和私钥；多协议入口依赖该 Trojan TLS listener。
 5. 客户端根据需要选择 Trojan、VLESS 空 flow、VLESS Vision 或 AnyTLS v1/v2，服务器地址、端口、SNI 和 UUID 保持一致。

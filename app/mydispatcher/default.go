@@ -214,19 +214,31 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	return inboundLink, outboundLink, nil
 }
 
-// wrapLink attaches the user traffic counters required by XrayR reporting to
-// links supplied through DispatchLink. Device and rate limiting remain on the
-// regular Dispatch path, where XrayR owns the pipe pair.
-func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) *transport.Link {
+// wrapLink applies the same per-user admission, aggregate rate limit and
+// traffic accounting as getLink without inserting another pipe pair. Keeping
+// the supplied link intact is required for VLESS Vision direct copy.
+func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) (*transport.Link, error) {
 	sessionInbound := session.InboundFromContext(ctx)
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
 	}
 
-	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
-
 	if user != nil && len(user.Email) > 0 {
+		bucket, limited, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String(), sessionInbound.Source.Network == net.Network_TCP)
+		if reject {
+			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
+			common.Interrupt(link.Reader)
+			common.Interrupt(link.Writer)
+			return nil, newError("Devices reach the limit: ", user.Email)
+		}
+		if limited {
+			// Both directions intentionally share the user's aggregate bucket.
+			link.Reader = d.Limiter.RateReader(ctx, link.Reader, bucket)
+			link.Writer = d.Limiter.RateWriter(ctx, link.Writer, bucket)
+		}
+
+		link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
@@ -243,9 +255,11 @@ func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) 
 				}
 			}
 		}
+	} else {
+		link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 	}
 
-	return link
+	return link, nil
 }
 
 func (d *DefaultDispatcher) shouldOverride(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) bool {
@@ -360,7 +374,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
 	}
-	outbound = d.wrapLink(ctx, outbound)
+	var err error
+	outbound, err = d.wrapLink(ctx, outbound)
+	if err != nil {
+		return err
+	}
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
 		d.routedDispatch(ctx, outbound, destination)

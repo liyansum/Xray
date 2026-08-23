@@ -2,7 +2,7 @@
 
 这是一个修改版的 XrayR，将专用 Xray-core 直接整合进同一源码仓库，并在普通 Trojan + TLS 节点上提供同端口多协议入站。
 
-本项目支持对接 [wyx2685/v2board](https://github.com/wyx2685/v2board) 修改版 V2board。面板服务端和 XrayR 均按照普通 Trojan 节点配置即可，不需要在面板中新增 VLESS 或 AnyTLS 节点类型。
+本项目支持对接 [liyansum/v2board](https://github.com/liyansum/v2board) 修改版 V2board。面板服务端和 XrayR 均按照普通 Trojan 节点配置即可，不需要在面板中新增 VLESS 或 AnyTLS 节点类型。
 
 > 本项目只适用于下方列出的协议和功能，不是完整上游 XrayR/Xray-core 的替代品。
 
@@ -49,7 +49,7 @@ AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1
 
 ### 修改版 V2board
 
-配合 [wyx2685/v2board](https://github.com/wyx2685/v2board) 使用时：
+配合 [liyansum/v2board](https://github.com/liyansum/v2board) 使用时：
 
 1. 在面板中创建普通 Trojan 节点，配置节点端口和域名。
 2. 用户信息继续由面板下发 UUID，不需要为不同协议创建多份用户。
@@ -95,13 +95,15 @@ Nodes:
 
 完整配置字段可参考仓库中的 [`release/config/config.yml.example`](release/config/config.yml.example)。面板和 XrayR 仍然只需要配置普通 Trojan 节点；不要额外建立 VLESS 或 AnyTLS 节点。
 
+文档和部署兼容基线为 `liyansum/v2board` 的 `master` 分支，基线提交是 `074dd516cd3f936908d8905b8fae89c0d6114c49`（2024-12-29）。该仓库 fork 自 [wyx2685/v2board](https://github.com/wyx2685/v2board)。截至 2026-08-24，检查的上游提交 `3cfb3f0d318e7158a0394e247e1479622cd21d3e` 所提供的 UniProxy JSON 接口与本项目使用的 Trojan 字段仍保持代码级兼容，但没有将该上游版本作为生产部署组合进行完整验证；已有面板不要仅依据代码级兼容结论直接升级，应先备份并在测试环境验证数据库迁移、缓存、队列和用户/流量上报。
+
 ### 其他面板
 
-代码保留以下面板适配器，但本修改版的主要适配目标是 `wyx2685/v2board`：
+代码保留以下面板适配器，但本修改版明确支持的主要适配目标是 `liyansum/v2board`：
 
 | 面板类型 | `PanelType` | Trojan | Shadowsocks |
 | --- | --- | --- | --- |
-| 修改版 V2board | `NewV2board` 或 `V2board` | 支持 | 支持 |
+| `liyansum/v2board` 修改版 | `NewV2board` 或 `V2board` | 支持 | 支持 |
 | SSPanel-UIM | `SSpanel` | 支持 | 支持 |
 | PMPanel | `PMpanel` | 支持 | 支持 |
 | ProxyPanel | `Proxypanel` | 支持 | 支持 |
@@ -203,6 +205,7 @@ go vet ./proxy ./proxy/trojan
 
 - [Project X](https://github.com/XTLS/)
 - [XrayR](https://github.com/XrayR-project/XrayR)
+- [liyansum/v2board](https://github.com/liyansum/v2board)
 - [wyx2685/v2board](https://github.com/wyx2685/v2board)
 - [V2Fly](https://github.com/v2fly)
 - [sing-box](https://github.com/SagerNet/sing-box)

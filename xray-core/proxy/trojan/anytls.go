@@ -42,6 +42,7 @@ const (
 
 	anyTLSFrameHeaderSize = 7
 	anyTLSUoTMagic        = "sp.v2.udp-over-tcp.arpa"
+	anyTLSStreamIDError   = "AnyTLS stream ID is not strictly increasing"
 )
 
 var (
@@ -122,6 +123,7 @@ type anyTLSServerSession struct {
 
 	receivedSettings bool
 	peerVersion      int
+	lastPeerStreamID uint32
 }
 
 func newAnyTLSServerSession(ctx context.Context, conn stat.Connection, reader io.Reader, activity signal.ActivityUpdater, onStream func(*anyTLSStream)) *anyTLSServerSession {
@@ -179,7 +181,10 @@ func (s *anyTLSServerSession) run() error {
 				if length != 0 || streamID == 0 {
 					return errors.New("invalid AnyTLS SYN frame")
 				}
-				s.openStream(streamID)
+				if err := s.openStream(streamID); err != nil {
+					_ = s.writeFrame(anyTLSCmdAlert, 0, []byte(anyTLSStreamIDError))
+					return err
+				}
 			case anyTLSCmdPSH:
 				stream := s.getStream(streamID)
 				if stream != nil && len(data) != 0 {
@@ -243,12 +248,13 @@ func (s *anyTLSServerSession) handleSettings(data []byte) error {
 	return nil
 }
 
-func (s *anyTLSServerSession) openStream(id uint32) {
+func (s *anyTLSServerSession) openStream(id uint32) error {
 	s.mu.Lock()
-	if _, exists := s.streams[id]; exists {
+	if id <= s.lastPeerStreamID {
 		s.mu.Unlock()
-		return
+		return errors.New(anyTLSStreamIDError)
 	}
+	s.lastPeerStreamID = id
 	stream := newAnyTLSStream(id, s)
 	s.streams[id] = stream
 	s.wg.Add(1)
@@ -258,6 +264,7 @@ func (s *anyTLSServerSession) openStream(id uint32) {
 		defer stream.Close()
 		s.onStream(stream)
 	}()
+	return nil
 }
 
 func (s *anyTLSServerSession) getStream(id uint32) *anyTLSStream {

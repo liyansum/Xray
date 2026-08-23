@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"io"
 	stdnet "net"
+	"strings"
 	"testing"
 	"time"
 
@@ -259,6 +260,93 @@ func TestAnyTLSV1Session(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("AnyTLS v1 server session did not stop")
+	}
+}
+
+func TestAnyTLSRejectsNonIncreasingStreamID(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		streamIDs []uint32
+	}{
+		{name: "duplicate", streamIDs: []uint32{2, 2}},
+		{name: "decreasing", streamIDs: []uint32{2, 1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			serverConn, clientConn := stdnet.Pipe()
+			defer clientConn.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			session := newAnyTLSServerSession(ctx, serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+			done := make(chan error, 1)
+			go func() { done <- session.run() }()
+
+			settings := []byte("v=2\nclient=xray-test\npadding-md5=" + anyTLSPaddingMD5)
+			writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSettings, 0, settings)
+			if command, _, _ := readTestAnyTLSFrame(t, clientConn); command != anyTLSCmdServerSetting {
+				t.Fatalf("unexpected server settings command: %d", command)
+			}
+
+			writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, test.streamIDs[0], nil)
+			if command, streamID, _ := readTestAnyTLSFrame(t, clientConn); command != anyTLSCmdFIN || streamID != test.streamIDs[0] {
+				t.Fatalf("unexpected first stream response: command=%d stream=%d", command, streamID)
+			}
+
+			writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, test.streamIDs[1], nil)
+			command, streamID, data := readTestAnyTLSFrame(t, clientConn)
+			if command != anyTLSCmdAlert || streamID != 0 || string(data) != "AnyTLS stream ID is not strictly increasing" {
+				t.Fatalf("unexpected invalid-ID response: command=%d stream=%d data=%q", command, streamID, data)
+			}
+
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "stream ID is not strictly increasing") {
+					t.Fatalf("unexpected session result: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("AnyTLS session remained open after an invalid stream ID")
+			}
+		})
+	}
+}
+
+func TestAnyTLSDoesNotCapActiveIncreasingStreams(t *testing.T) {
+	const streamCount = 300
+	serverConn, clientConn := stdnet.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	opened := make(chan uint32, streamCount)
+	release := make(chan struct{})
+	session := newAnyTLSServerSession(ctx, serverConn, serverConn, testActivity{}, func(stream *anyTLSStream) {
+		opened <- stream.id
+		<-release
+	})
+	done := make(chan error, 1)
+	go func() { done <- session.run() }()
+
+	settings := []byte("v=1\nclient=xray-test\npadding-md5=" + anyTLSPaddingMD5)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSettings, 0, settings)
+	for i := uint32(0); i < streamCount; i++ {
+		writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, i*2+1, nil)
+	}
+	for i := uint32(0); i < streamCount; i++ {
+		select {
+		case streamID := <-opened:
+			if streamID == 0 || streamID%2 == 0 {
+				t.Fatalf("unexpected stream ID: %d", streamID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of %d increasing streams were opened", i, streamCount)
+		}
+	}
+
+	_ = clientConn.Close()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AnyTLS server session did not stop")
 	}
 }
 

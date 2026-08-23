@@ -43,7 +43,7 @@
 
 普通 VLESS 空 flow 不使用 Vision padding，因此代理 HTTPS 时仍具有普通 VLESS TLS-in-TLS 的流量特征；这不会改变 Trojan、AnyTLS、Vision 或 fallback 的行为。VLESS 仅开放 TCP 请求，其他 flow、VLESS UDP 和 VLESS Mux 不受支持。
 
-AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
+AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。客户端新建 stream 的 ID 必须严格递增（无需连续），重复或倒退会在已鉴权的加密会话内返回标准 Alert 并关闭该会话；服务端不限制同时活跃的 stream 数量。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
 
 ## 面板与节点配置
 
@@ -96,6 +96,8 @@ Nodes:
 完整配置字段可参考仓库中的 [`release/config/config.yml.example`](release/config/config.yml.example)。面板和 XrayR 仍然只需要配置普通 Trojan 节点；不要额外建立 VLESS 或 AnyTLS 节点。
 
 文档和部署兼容基线为 `liyansum/v2board` 的 `master` 分支，基线提交是 `074dd516cd3f936908d8905b8fae89c0d6114c49`（2024-12-29）。该仓库 fork 自 [wyx2685/v2board](https://github.com/wyx2685/v2board)。截至 2026-08-24，检查的上游提交 `3cfb3f0d318e7158a0394e247e1479622cd21d3e` 所提供的 UniProxy JSON 接口与本项目使用的 Trojan 字段仍保持代码级兼容，但没有将该上游版本作为生产部署组合进行完整验证；已有面板不要仅依据代码级兼容结论直接升级，应先备份并在测试环境验证数据库迁移、缓存、队列和用户/流量上报。
+
+`NewV2board` 适配器会自动兼容两种设备统计接口：旧版面板（已验证 `71bb51d395cd939a04630df68b4ce05f87e164ca`）从 `/UniProxy/user` 的 `alive_ip` 字段读取，新版面板从独立的 `/UniProxy/alivelist` 读取。旧版不会额外请求不存在的接口；新版在用户列表返回 `304 Not Modified` 时仍会刷新在线设备数。临时面板错误会保留最后一次有效快照，设备限制按“面板已有设备数 + 当前统计周期新增 IP”原子判断。`ApiConfig.DeviceLimit: 0` 表示使用面板为各用户配置的限制，并非关闭设备限制。旧版面板只为本身已设置设备限制的用户返回 `alive_ip`，因此旧版组合应保持 `DeviceLimit: 0` 并在面板用户侧配置限制。
 
 ### 其他面板
 

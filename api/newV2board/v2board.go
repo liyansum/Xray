@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -30,7 +31,17 @@ type APIClient struct {
 	resp          atomic.Value
 	eTags         map[string]string
 	AliveMap      *AliveMap
+	aliveSource   aliveSource
+	lastUserList  []api.UserInfo
 }
+
+type aliveSource uint8
+
+const (
+	aliveSourceUnknown aliveSource = iota
+	aliveSourceUserList
+	aliveSourceEndpoint
+)
 
 // New create an api instance
 func New(apiConfig *api.Config) *APIClient {
@@ -143,11 +154,20 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		ForceContentType("application/json").
 		Get(path)
 
-	_, _ = c.GetUserAlive()
-
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
-	if res.StatusCode() == 304 {
+	if err == nil && res != nil && res.StatusCode() == 304 {
+		// New panels keep online counts in a separate resource, so it must still
+		// be refreshed when the user resource itself is unchanged. On old panels
+		// alive_ip participates in the user ETag and the previous snapshot remains
+		// valid for a 304 response.
+		if c.aliveSource != aliveSourceUserList {
+			_, _ = c.GetUserAlive()
+		}
 		return nil, errors.New(api.UserNotModified)
+	}
+	if err != nil || res == nil {
+		_, parseErr := c.parseResponse(res, path, err)
+		return nil, parseErr
 	}
 	// update etag
 	if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTags["users"] {
@@ -158,14 +178,21 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	if err != nil {
 		return nil, err
 	}
-	b, _ := usersResp.Get("users").Encode()
-	json.Unmarshal(b, &users)
+	b, err := usersResp.Get("users").Encode()
+	if err != nil {
+		return nil, fmt.Errorf("encode users response: %w", err)
+	}
+	if err := json.Unmarshal(b, &users); err != nil {
+		return nil, fmt.Errorf("unmarshal users response: %w", err)
+	}
 	if len(users) == 0 {
 		return nil, errors.New("users is null")
 	}
 
-	var deviceLimit int = 0
-	var userList []api.UserInfo
+	var deviceLimit int
+	userList := make([]api.UserInfo, 0, len(users))
+	embeddedAlive := make(map[int]int)
+	hasEmbeddedAlive := false
 	for _, user := range users {
 		u := api.UserInfo{
 			UID:  user.Id,
@@ -185,6 +212,10 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		}
 
 		u.DeviceLimit = deviceLimit
+		if user.AliveIP != nil {
+			hasEmbeddedAlive = true
+			embeddedAlive[user.Id] = max(*user.AliveIP, 0)
+		}
 		u.Email = u.UUID + "@v2board.user"
 		if c.NodeType == "Shadowsocks" {
 			u.Passwd = u.UUID
@@ -193,7 +224,37 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		userList = append(userList, u)
 	}
 
+	if hasEmbeddedAlive {
+		// Legacy panel: alive_ip is part of /user. Do not probe an endpoint that
+		// does not exist on those releases.
+		c.setAliveMap(embeddedAlive)
+		c.aliveSource = aliveSourceUserList
+	} else {
+		// This also permits a running panel to be upgraded from the embedded
+		// format: the first response without alive_ip probes the new endpoint.
+		if c.aliveSource == aliveSourceUserList {
+			c.aliveSource = aliveSourceUnknown
+		}
+		_, _ = c.GetUserAlive()
+	}
+
+	if slices.Equal(c.lastUserList, userList) {
+		// Old panels include alive_ip in the user ETag. Avoid rebuilding users and
+		// counters when only the online-device snapshot changed.
+		return nil, errors.New(api.UserNotModified)
+	}
+	c.lastUserList = append(c.lastUserList[:0], userList...)
+
 	return &userList, nil
+}
+
+func (c *APIClient) setAliveMap(alive map[int]int) {
+	for uid, count := range alive {
+		alive[uid] = max(count, 0)
+	}
+	// Both callers pass a freshly decoded or newly built map. Publish it as an
+	// immutable snapshot; the limiter makes its own copy at the API boundary.
+	c.AliveMap = &AliveMap{Alive: alive}
 }
 
 // GetUserAlive will fetch the alive_ip count for users
@@ -202,20 +263,26 @@ func (c *APIClient) GetUserAlive() (map[int]int, error) {
 	r, err := c.client.R().
 		ForceContentType("application/json").
 		Get(path)
-	if err != nil || r.StatusCode() > 399 {
-		c.AliveMap.Alive = make(map[int]int)
-		return nil, nil
+	if err != nil {
+		return c.AliveMap.Alive, err
 	}
-
-	if r != nil {
-		defer r.RawResponse.Body.Close()
-	} else {
-		return nil, fmt.Errorf("received nil response")
+	if r == nil {
+		return c.AliveMap.Alive, fmt.Errorf("received nil response")
 	}
-	c.AliveMap = &AliveMap{}
-	if err := json.Unmarshal(r.Body(), c.AliveMap); err != nil {
+	if r.StatusCode() > 399 {
+		// Preserve the last known snapshot on a transient panel error. Clearing it
+		// would temporarily disable device limits.
+		return c.AliveMap.Alive, fmt.Errorf("alive list endpoint returned status %d", r.StatusCode())
+	}
+	alive := &AliveMap{}
+	if err := json.Unmarshal(r.Body(), alive); err != nil {
 		return nil, fmt.Errorf("unmarshal user alive list error: %s", err)
 	}
+	if alive.Alive == nil {
+		alive.Alive = make(map[int]int)
+	}
+	c.setAliveMap(alive.Alive)
+	c.aliveSource = aliveSourceEndpoint
 
 	return c.AliveMap.Alive, nil
 }

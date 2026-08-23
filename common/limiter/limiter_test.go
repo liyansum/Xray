@@ -2,7 +2,9 @@ package limiter
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/liyansum/Xray/api"
@@ -22,8 +24,11 @@ func TestRemoveInboundUsersReclaimsState(t *testing.T) {
 	inbound := value.(*InboundInfo)
 	removedEmail := "node|first@example.com|1"
 	inbound.BucketHub.Store(removedEmail, rate.NewLimiter(1, 1))
-	inbound.UserOnlineIP.Store(removedEmail, new(sync.Map))
-	inbound.OldUserOnline.Store("192.0.2.1", 1)
+	state := newUserDeviceState()
+	state.current["192.0.2.1"] = 1
+	inbound.userDevices.Store(removedEmail, state)
+	oldOnline := map[deviceIdentity]struct{}{{uid: 1, ip: "192.0.2.1"}: {}}
+	inbound.oldOnlineSet.Store(&oldOnline)
 
 	if err := limiter.RemoveInboundUsers("node", []string{removedEmail}); err != nil {
 		t.Fatal(err)
@@ -34,10 +39,10 @@ func TestRemoveInboundUsersReclaimsState(t *testing.T) {
 	if _, found := inbound.BucketHub.Load(removedEmail); found {
 		t.Fatal("removed user's rate bucket remains")
 	}
-	if _, found := inbound.UserOnlineIP.Load(removedEmail); found {
+	if _, found := inbound.userDevices.Load(removedEmail); found {
 		t.Fatal("removed user's online IP state remains")
 	}
-	if _, found := inbound.OldUserOnline.Load("192.0.2.1"); found {
+	if inbound.wasOnline(1, "192.0.2.1") {
 		t.Fatal("removed user's historical IP remains")
 	}
 	if _, found := (*inbound.userInfo.Load())["node|second@example.com|2"]; !found {
@@ -53,18 +58,93 @@ func TestOldUserOnlineIsReplacedEachReport(t *testing.T) {
 	}
 	value, _ := limiter.InboundInfo.Load("node")
 	inbound := value.(*InboundInfo)
-	inbound.OldUserOnline.Store("192.0.2.1", 1)
-	ipMap := new(sync.Map)
-	ipMap.Store("192.0.2.2", 1)
-	inbound.UserOnlineIP.Store("node|user@example.com|1", ipMap)
+	oldOnline := map[deviceIdentity]struct{}{{uid: 1, ip: "192.0.2.1"}: {}}
+	inbound.oldOnlineSet.Store(&oldOnline)
+	state := newUserDeviceState()
+	state.current["192.0.2.2"] = 1
+	inbound.userDevices.Store("node|user@example.com|1", state)
 	if _, err := limiter.GetOnlineDevice("node"); err != nil {
 		t.Fatal(err)
 	}
-	if _, found := inbound.OldUserOnline.Load("192.0.2.1"); found {
+	if inbound.wasOnline(1, "192.0.2.1") {
 		t.Fatal("previous reporting period remains")
 	}
-	if _, found := inbound.OldUserOnline.Load("192.0.2.2"); !found {
+	if !inbound.wasOnline(1, "192.0.2.2") {
 		t.Fatal("current reporting period was not retained")
+	}
+}
+
+func TestDeviceLimitCountsPanelBaselineAndCurrentPeriod(t *testing.T) {
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com", DeviceLimit: 2}}
+	limiter := New()
+	if err := limiter.AddInboundLimiter("node", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := limiter.InboundInfo.Load("node")
+	inbound := value.(*InboundInfo)
+	inbound.SetAliveList(map[int]int{1: 1})
+	email := "node|user@example.com|1"
+
+	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+		t.Fatal("first current-period device was rejected")
+	}
+	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.2", true); !reject {
+		t.Fatal("device exceeding panel baseline plus local additions was accepted")
+	}
+	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+		t.Fatal("an already accepted device consumed another slot")
+	}
+}
+
+func TestPreviousPeriodDeviceDoesNotConsumeAnotherSlot(t *testing.T) {
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com", DeviceLimit: 2}}
+	limiter := New()
+	if err := limiter.AddInboundLimiter("node", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	email := "node|user@example.com|1"
+	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+		t.Fatal("initial device was rejected")
+	}
+	if _, err := limiter.GetOnlineDevice("node"); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := limiter.InboundInfo.Load("node")
+	value.(*InboundInfo).SetAliveList(map[int]int{1: 1})
+
+	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+		t.Fatal("previous-period device was counted twice")
+	}
+	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.2", true); reject {
+		t.Fatal("one genuinely new device should fit the remaining slot")
+	}
+	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.3", true); !reject {
+		t.Fatal("third device was accepted")
+	}
+}
+
+func TestConcurrentDeviceAdmissionDoesNotExceedLimit(t *testing.T) {
+	const deviceLimit = 10
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com", DeviceLimit: deviceLimit}}
+	limiter := New()
+	if err := limiter.AddInboundLimiter("node", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	email := "node|user@example.com|1"
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	for i := range 100 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, reject := limiter.GetUserBucket("node", email, fmt.Sprintf("192.0.2.%d", i), true); !reject {
+				accepted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != deviceLimit {
+		t.Fatalf("accepted %d devices, want %d", got, deviceLimit)
 	}
 }
 

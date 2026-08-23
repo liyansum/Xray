@@ -39,6 +39,10 @@ type user struct {
 	Uuid        string `json:"uuid"`
 	SpeedLimit  int    `json:"speed_limit"`
 	DeviceLimit int    `json:"device_limit"`
+	// Older wyx2685/v2board releases embed the current device count in
+	// /UniProxy/user instead of exposing /UniProxy/alivelist. A pointer keeps
+	// an omitted field distinguishable from a legitimate zero count.
+	AliveIP *int `json:"alive_ip"`
 }
 
 type AliveMap struct {

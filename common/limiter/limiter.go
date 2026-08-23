@@ -28,19 +28,56 @@ type UserInfo struct {
 	DeviceLimit int
 }
 
+type deviceIdentity struct {
+	uid int
+	ip  string
+}
+
+// userDeviceState separates devices already represented by the panel's
+// previous-period count from devices first seen in the current period.
+// A per-user lock keeps concurrent connection attempts from exceeding the
+// configured limit without serializing authentication for unrelated users.
+type userDeviceState struct {
+	mu      sync.Mutex
+	current map[string]int
+	added   map[string]struct{}
+}
+
+func newUserDeviceState() *userDeviceState {
+	return &userDeviceState{
+		current: make(map[string]int),
+		added:   make(map[string]struct{}),
+	}
+}
+
+func (s *userDeviceState) hasCurrent() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.current) != 0
+}
+
+func (s *userDeviceState) snapshotAndReset() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.current
+	s.current = make(map[string]int)
+	s.added = make(map[string]struct{})
+	return current
+}
+
 type InboundInfo struct {
 	Tag            string
 	NodeSpeedLimit uint64
 	userInfo       atomic.Pointer[map[string]UserInfo] // Immutable; key: Email
 	BucketHub      *sync.Map                           // key: Email, value: *rate.Limiter
-	UserOnlineIP   *sync.Map                           // Key: Email, value: {Key: IP, value: UID}
+	userDevices    *sync.Map                           // Key: Email, value: *userDeviceState
 	GlobalLimit    struct {
 		config         *GlobalDeviceLimitConfig
 		globalOnlineIP *marshaler.Marshaler
 		redisClient    *redis.Client
 	}
-	aliveList     atomic.Pointer[map[int]int] // Key: Uid, value: alive_ip
-	OldUserOnline *sync.Map                   // Key: IP, value: UID from the previous reporting period
+	aliveList    atomic.Pointer[map[int]int]                 // Key: Uid, value: alive_ip
+	oldOnlineSet atomic.Pointer[map[deviceIdentity]struct{}] // Previous reporting period
 }
 
 type Limiter struct {
@@ -56,7 +93,11 @@ func New() *Limiter {
 // SetAliveList atomically publishes the latest immutable alive-device map.
 // API clients replace this map after decoding instead of mutating it in place.
 func (i *InboundInfo) SetAliveList(alive map[int]int) {
-	i.aliveList.Store(&alive)
+	snapshot := make(map[int]int, len(alive))
+	for uid, count := range alive {
+		snapshot[uid] = max(count, 0)
+	}
+	i.aliveList.Store(&snapshot)
 }
 
 func (i *InboundInfo) aliveCount(uid int) int {
@@ -65,6 +106,48 @@ func (i *InboundInfo) aliveCount(uid int) int {
 		return 0
 	}
 	return (*alive)[uid]
+}
+
+func (i *InboundInfo) wasOnline(uid int, ip string) bool {
+	previous := i.oldOnlineSet.Load()
+	if previous == nil {
+		return false
+	}
+	_, found := (*previous)[deviceIdentity{uid: uid, ip: ip}]
+	return found
+}
+
+func (i *InboundInfo) deviceState(email string) *userDeviceState {
+	if state, found := i.userDevices.Load(email); found {
+		return state.(*userDeviceState)
+	}
+	state := newUserDeviceState()
+	actual, _ := i.userDevices.LoadOrStore(email, state)
+	return actual.(*userDeviceState)
+}
+
+func (i *InboundInfo) registerDevice(email string, uid int, ip string, deviceLimit int) bool {
+	state := i.deviceState(email)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if _, found := state.current[ip]; found {
+		return false
+	}
+
+	// Devices seen in the preceding report are already included in aliveCount;
+	// accepting them again must not consume another slot.
+	if i.wasOnline(uid, ip) {
+		state.current[ip] = uid
+		return false
+	}
+
+	if deviceLimit > 0 && i.aliveCount(uid)+len(state.added) >= deviceLimit {
+		return true
+	}
+	state.current[ip] = uid
+	state.added[ip] = struct{}{}
+	return false
 }
 
 func buildUserInfoMap(tag string, users []api.UserInfo) *map[string]UserInfo {
@@ -127,14 +210,23 @@ func (i *InboundInfo) removeUsers(emails []string) {
 	}
 	for email := range removed {
 		i.BucketHub.Delete(email)
-		i.UserOnlineIP.Delete(email)
+		i.userDevices.Delete(email)
 	}
-	i.OldUserOnline.Range(func(key, value any) bool {
-		if _, found := removedUIDs[value.(int)]; found {
-			i.OldUserOnline.Delete(key)
+	for {
+		current := i.oldOnlineSet.Load()
+		if current == nil {
+			break
 		}
-		return true
-	})
+		next := make(map[deviceIdentity]struct{}, len(*current))
+		for identity := range *current {
+			if _, found := removedUIDs[identity.uid]; !found {
+				next[identity] = struct{}{}
+			}
+		}
+		if i.oldOnlineSet.CompareAndSwap(current, &next) {
+			break
+		}
+	}
 }
 
 func (i *InboundInfo) close() error {
@@ -149,9 +241,10 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList 
 		Tag:            tag,
 		NodeSpeedLimit: nodeSpeedLimit,
 		BucketHub:      new(sync.Map),
-		UserOnlineIP:   new(sync.Map),
-		OldUserOnline:  new(sync.Map),
+		userDevices:    new(sync.Map),
 	}
+	emptyOldOnline := make(map[deviceIdentity]struct{})
+	inboundInfo.oldOnlineSet.Store(&emptyOldOnline)
 
 	if globalLimit != nil && globalLimit.Enable {
 		inboundInfo.GlobalLimit.config = globalLimit
@@ -234,30 +327,26 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
-		// OldUserOnline is only needed to bridge one reporting period. Replace
-		// the previous generation before publishing the current online set.
-		inboundInfo.OldUserOnline.Clear()
+		nextOldOnline := make(map[deviceIdentity]struct{})
 		// Clear Speed Limiter bucket for users who are not online
 		inboundInfo.BucketHub.Range(func(key, value interface{}) bool {
 			email := key.(string)
-			if _, exists := inboundInfo.UserOnlineIP.Load(email); !exists {
+			stateValue, exists := inboundInfo.userDevices.Load(email)
+			if !exists || !stateValue.(*userDeviceState).hasCurrent() {
 				inboundInfo.BucketHub.Delete(email)
 			}
 			return true
 		})
-		inboundInfo.UserOnlineIP.Range(func(key, value interface{}) bool {
-			email := key.(string)
-			ipMap := value.(*sync.Map)
-			ipMap.Range(func(key, value interface{}) bool {
-				uid := value.(int)
-				ip := key.(string)
-				inboundInfo.OldUserOnline.Store(ip, uid)
+		inboundInfo.userDevices.Range(func(_, value interface{}) bool {
+			for ip, uid := range value.(*userDeviceState).snapshotAndReset() {
+				nextOldOnline[deviceIdentity{uid: uid, ip: ip}] = struct{}{}
 				onlineUser = append(onlineUser, api.OnlineUser{UID: uid, IP: ip})
-				return true
-			})
-			inboundInfo.UserOnlineIP.Delete(email) // Reset online device
+			}
 			return true
 		})
+		// Publish one immutable generation so connection checks never observe a
+		// partially rebuilt previous-period set.
+		inboundInfo.oldOnlineSet.Store(&nextOldOnline)
 	} else {
 		return nil, fmt.Errorf("no such inbound in limiter: %s", tag)
 	}
@@ -285,38 +374,11 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP
 			}
 		}
 
-		// Local device limit, only for TCP connection
-		if isSourceTCP {
-			aliveIP := inboundInfo.aliveCount(uid)
-			// If any device is online
-			if v, ok := inboundInfo.UserOnlineIP.Load(email); ok {
-				ipMap := v.(*sync.Map)
-				// If this is a new ip
-				if _, ok := ipMap.LoadOrStore(ip, uid); !ok {
-					if deviceLimit > 0 && deviceLimit <= aliveIP {
-						ipMap.Delete(ip)
-						return nil, false, true
-					}
-				}
-			} else {
-				newIPMap := new(sync.Map)
-				newIPMap.Store(ip, uid)
-				actual, loaded := inboundInfo.UserOnlineIP.LoadOrStore(email, newIPMap)
-				if loaded {
-					ipMap := actual.(*sync.Map)
-					if _, ok := ipMap.LoadOrStore(ip, uid); !ok && deviceLimit > 0 && deviceLimit <= aliveIP {
-						ipMap.Delete(ip)
-						return nil, false, true
-					}
-				} else if v, ok := inboundInfo.OldUserOnline.Load(ip); ok {
-					if v.(int) == uid {
-						inboundInfo.OldUserOnline.Delete(ip)
-					}
-				} else if deviceLimit > 0 && deviceLimit <= aliveIP {
-					inboundInfo.UserOnlineIP.Delete(email)
-					return nil, false, true
-				}
-			}
+		// Device limits apply only to TCP source connections. The user-specific
+		// state makes admission atomic while allowing unrelated users to connect
+		// concurrently.
+		if isSourceTCP && inboundInfo.registerDevice(email, uid, ip, deviceLimit) {
+			return nil, false, true
 		}
 
 		// GlobalLimit

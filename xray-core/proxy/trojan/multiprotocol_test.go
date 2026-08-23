@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/protobuf/encoding/protowire"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 )
@@ -242,6 +243,10 @@ func TestMultiProtocolAuthenticationDuringUserUpdates(t *testing.T) {
 }
 
 func makeVLESSRequest(t *testing.T, user *protocol.MemoryUser, flow string) []byte {
+	return makeVLESSRequestFor(t, user, flow, protocol.RequestCommandTCP, net.TCPDestination(net.DomainAddress("example.com"), 443))
+}
+
+func makeVLESSRequestFor(t *testing.T, user *protocol.MemoryUser, flow string, command protocol.RequestCommand, destination net.Destination) []byte {
 	t.Helper()
 	id, _, err := userProtocolKeys(user)
 	if err != nil {
@@ -255,28 +260,77 @@ func makeVLESSRequest(t *testing.T, user *protocol.MemoryUser, flow string) []by
 	}
 	request = append(request, byte(len(addons)))
 	request = append(request, addons...)
-	request = append(request, byte(protocol.RequestCommandTCP))
-	var destination bytes.Buffer
-	if err := vlessAddressParser.WriteAddressPort(&destination, net.DomainAddress("example.com"), 443); err != nil {
+	request = append(request, byte(command))
+	if command == protocol.RequestCommandMux {
+		return request
+	}
+	var encodedDestination bytes.Buffer
+	if err := vlessAddressParser.WriteAddressPort(&encodedDestination, destination.Address, destination.Port); err != nil {
 		t.Fatal(err)
 	}
-	return append(request, destination.Bytes()...)
+	return append(request, encodedDestination.Bytes()...)
 }
 
 func TestVLESSRequestFlowModes(t *testing.T) {
 	user := testMultiUser(t)
 	for _, expectedFlow := range []string{"", "xtls-rprx-vision"} {
 		request := makeVLESSRequest(t, user, expectedFlow)
-		id, destination, flow, err := readVLESSRequest(bytes.NewReader(request), user)
+		id, destination, flow, command, err := readVLESSRequest(bytes.NewReader(request), user)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(id) != 16 || destination.String() != "tcp:example.com:443" || flow != expectedFlow {
-			t.Fatalf("id=%x destination=%s flow=%q", id, destination.String(), flow)
+		if len(id) != 16 || destination.String() != "tcp:example.com:443" || flow != expectedFlow || command != protocol.RequestCommandTCP {
+			t.Fatalf("id=%x destination=%s flow=%q command=%v", id, destination.String(), flow, command)
 		}
 	}
-	if _, _, _, err := readVLESSRequest(bytes.NewReader(makeVLESSRequest(t, user, "unsupported-flow")), user); err == nil {
+	if _, _, _, _, err := readVLESSRequest(bytes.NewReader(makeVLESSRequest(t, user, "unsupported-flow")), user); err == nil {
 		t.Fatal("unsupported VLESS flow was accepted")
+	}
+
+	udpDestination := net.UDPDestination(net.DomainAddress("quic.example"), 443)
+	udpRequest := makeVLESSRequestFor(t, user, "", protocol.RequestCommandUDP, udpDestination)
+	_, destination, flow, command, err := readVLESSRequest(bytes.NewReader(udpRequest), user)
+	if err != nil || destination != udpDestination || flow != "" || command != protocol.RequestCommandUDP {
+		t.Fatalf("UDP destination=%s flow=%q command=%v err=%v", destination, flow, command, err)
+	}
+	visionUDP := makeVLESSRequestFor(t, user, vlessVisionFlow, protocol.RequestCommandUDP, udpDestination)
+	if _, _, _, _, err := readVLESSRequest(bytes.NewReader(visionUDP), user); err == nil {
+		t.Fatal("Vision direct UDP was accepted instead of requiring XUDP")
+	}
+
+	for _, wireFlow := range []string{vlessVisionFlow, vlessVisionUDP443Flow} {
+		muxRequest := makeVLESSRequestFor(t, user, wireFlow, protocol.RequestCommandMux, net.Destination{})
+		_, destination, flow, command, err := readVLESSRequest(bytes.NewReader(muxRequest), user)
+		if err != nil || destination != vlessMuxDestination || flow != vlessVisionFlow || command != protocol.RequestCommandMux {
+			t.Fatalf("flow=%q Mux destination=%s normalizedFlow=%q command=%v err=%v", wireFlow, destination, flow, command, err)
+		}
+	}
+}
+
+func TestVLESSUDPPacketCodecPreservesDatagrams(t *testing.T) {
+	var wire bytes.Buffer
+	writer := newVLESSMultiLengthPacketWriter(buf.NewWriter(&wire))
+	packets := [][]byte{{0xc3, 0, 0, 1, 'q'}, []byte("second-datagram")}
+	mb := make(buf.MultiBuffer, 0, len(packets))
+	for _, packet := range packets {
+		mb = append(mb, buf.FromBytes(packet))
+	}
+	if err := writer.WriteMultiBuffer(mb); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := newVLESSLengthPacketReader(&wire)
+	for _, expected := range packets {
+		packet, err := reader.ReadMultiBuffer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := make([]byte, packet.Len())
+		packet.Copy(data)
+		buf.ReleaseMulti(packet)
+		if !bytes.Equal(data, expected) {
+			t.Fatalf("packet=%x expected=%x", data, expected)
+		}
 	}
 }
 

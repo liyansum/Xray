@@ -19,8 +19,11 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/xudp"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy"
@@ -44,6 +47,92 @@ type visionTestDispatcher struct {
 type anyTLSTestDispatcher struct {
 	received chan []byte
 	metadata chan *session.Inbound
+}
+
+type vlessUDPDispatch struct {
+	destination net.Destination
+	payload     []byte
+	inbound     *session.Inbound
+}
+
+type vlessUDPTestDispatcher struct {
+	received chan vlessUDPDispatch
+	response []byte
+}
+
+func (*vlessUDPTestDispatcher) Type() interface{} { return routing.DispatcherType() }
+func (*vlessUDPTestDispatcher) Start() error      { return nil }
+func (*vlessUDPTestDispatcher) Close() error      { return nil }
+
+func (d *vlessUDPTestDispatcher) record(ctx context.Context, destination net.Destination, payload buf.MultiBuffer) {
+	data := make([]byte, payload.Len())
+	payload.Copy(data)
+	buf.ReleaseMulti(payload)
+	var inboundCopy *session.Inbound
+	if inbound := session.InboundFromContext(ctx); inbound != nil {
+		copy := *inbound
+		inboundCopy = &copy
+	}
+	d.received <- vlessUDPDispatch{destination: destination, payload: data, inbound: inboundCopy}
+}
+
+func (d *vlessUDPTestDispatcher) DispatchLink(ctx context.Context, destination net.Destination, link *transport.Link) error {
+	payload, err := link.Reader.ReadMultiBuffer()
+	if err != nil {
+		return err
+	}
+	d.record(ctx, destination, payload)
+	return link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(d.response)})
+}
+
+func (d *vlessUDPTestDispatcher) Dispatch(ctx context.Context, destination net.Destination) (*transport.Link, error) {
+	uplinkReader, uplinkWriter := pipe.New(pipe.WithoutSizeLimit())
+	downlinkReader, downlinkWriter := pipe.New(pipe.WithoutSizeLimit())
+	go func() {
+		payload, err := uplinkReader.ReadMultiBuffer()
+		if err == nil {
+			d.record(ctx, destination, payload)
+			_ = downlinkWriter.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(d.response)})
+		}
+		_ = downlinkWriter.Close()
+	}()
+	return &transport.Link{Reader: downlinkReader, Writer: uplinkWriter}, nil
+}
+
+func makeTestXUDPPayload(t *testing.T, destination net.Destination, payload []byte, globalID [8]byte) []byte {
+	t.Helper()
+	var muxPayload bytes.Buffer
+	packet := buf.FromBytes(payload)
+	packet.UDP = &destination
+	if err := xudp.NewPacketWriter(buf.NewWriter(&muxPayload), destination, globalID).WriteMultiBuffer(buf.MultiBuffer{packet}); err != nil {
+		t.Fatal(err)
+	}
+	return append([]byte(nil), muxPayload.Bytes()...)
+}
+
+func clearTestXUDPAssociation(t *testing.T, globalID [8]byte) {
+	t.Helper()
+	cleanupDeadline := time.Now().Add(2 * time.Second)
+	for {
+		mux.XUDPManager.Lock()
+		cached := mux.XUDPManager.Map[globalID]
+		expiring := cached != nil && cached.Status == mux.Expiring
+		if expiring {
+			// Xray intentionally retains a closed XUDP association for one minute
+			// so a reconnect can reuse it. Remove this test entry after verifying
+			// that it reached the bounded expiry state.
+			cached.Interrupt()
+			delete(mux.XUDPManager.Map, globalID)
+		}
+		mux.XUDPManager.Unlock()
+		if cached == nil || expiring {
+			return
+		}
+		if time.Now().After(cleanupDeadline) {
+			t.Fatal("closed XUDP session did not enter its bounded expiry state")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (*anyTLSTestDispatcher) Type() interface{} { return routing.DispatcherType() }
@@ -247,6 +336,251 @@ func TestVLESSWithoutFlowOverExistingTLS(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("VLESS without flow inbound did not stop")
 	}
+}
+
+func TestVLESSWithoutFlowUDP443OverExistingTLS(t *testing.T) {
+	server, user := testMultiServer(t)
+	server.policyManager = &testPolicyManager{}
+	dispatcher := &vlessUDPTestDispatcher{
+		received: make(chan vlessUDPDispatch, 1),
+		response: []byte("quic-response"),
+	}
+
+	serverRaw, clientRaw := stdnet.Pipe()
+	serverTLS := xraytls.Server(serverRaw, &gotls.Config{
+		Certificates: []gotls.Certificate{testTLSCertificate(t)}, MinVersion: gotls.VersionTLS12, MaxVersion: gotls.VersionTLS12,
+	}).(*xraytls.Conn)
+	clientTLS := gotls.Client(clientRaw, &gotls.Config{
+		InsecureSkipVerify: true, ServerName: "localhost", MinVersion: gotls.VersionTLS12, MaxVersion: gotls.VersionTLS12,
+	})
+	defer clientTLS.Close()
+	defer serverTLS.Close()
+
+	inbound := &session.Inbound{
+		Source: net.TCPDestination(net.LocalHostIP, 12347),
+		Local:  net.TCPDestination(net.LocalHostIP, 443),
+		Conn:   serverTLS,
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	done := make(chan error, 1)
+	go func() { done <- server.Process(ctx, net.Network_TCP, serverTLS, dispatcher) }()
+
+	destination := net.UDPDestination(net.DomainAddress("quic.example"), 443)
+	payload := []byte{0xc3, 0x00, 0x00, 0x00, 0x01, 'q', 'u', 'i', 'c'}
+	request := makeVLESSRequestFor(t, user, "", protocol.RequestCommandUDP, destination)
+	request = binary.BigEndian.AppendUint16(request, uint16(len(payload)))
+	request = append(request, payload...)
+	if _, err := clientTLS.Write(request); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-dispatcher.received:
+		if got.destination != destination || !bytes.Equal(got.payload, payload) {
+			t.Fatalf("destination=%s payload=%x", got.destination, got.payload)
+		}
+		if got.inbound == nil || got.inbound.Name != "vless" || got.inbound.User != user {
+			t.Fatalf("inbound metadata=%+v", got.inbound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("VLESS UDP/443 request was not dispatched")
+	}
+
+	response := make([]byte, 2+2+len(dispatcher.response))
+	if _, err := io.ReadFull(clientTLS, response); err != nil {
+		t.Fatal(err)
+	}
+	if response[0] != 0 || response[1] != 0 || int(binary.BigEndian.Uint16(response[2:4])) != len(dispatcher.response) || !bytes.Equal(response[4:], dispatcher.response) {
+		t.Fatalf("response=%x", response)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("VLESS UDP inbound did not stop")
+	}
+}
+
+func TestVLESSWithoutFlowXUDP443OverExistingTLS(t *testing.T) {
+	server, user := testMultiServer(t)
+	server.policyManager = &testPolicyManager{}
+	dispatcher := &vlessUDPTestDispatcher{
+		received: make(chan vlessUDPDispatch, 1),
+		response: []byte("plain-xudp-response"),
+	}
+
+	serverRaw, clientRaw := stdnet.Pipe()
+	serverTLS := xraytls.Server(serverRaw, &gotls.Config{
+		Certificates: []gotls.Certificate{testTLSCertificate(t)}, MinVersion: gotls.VersionTLS12, MaxVersion: gotls.VersionTLS12,
+	}).(*xraytls.Conn)
+	clientTLS := gotls.Client(clientRaw, &gotls.Config{
+		InsecureSkipVerify: true, ServerName: "localhost", MinVersion: gotls.VersionTLS12, MaxVersion: gotls.VersionTLS12,
+	})
+	defer clientTLS.Close()
+	defer serverTLS.Close()
+
+	inbound := &session.Inbound{
+		Source: net.TCPDestination(net.LocalHostIP, 12349),
+		Local:  net.TCPDestination(net.LocalHostIP, 443),
+		Conn:   serverTLS,
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	done := make(chan error, 1)
+	go func() { done <- server.Process(ctx, net.Network_TCP, serverTLS, dispatcher) }()
+
+	destination := net.UDPDestination(net.DomainAddress("quic.example"), 443)
+	payload := []byte{0xc3, 0x00, 0x00, 0x00, 0x01, 'm', 'u', 'x'}
+	globalID := [8]byte{11, 12, 13, 14, 15, 16, 17, 18}
+	request := makeVLESSRequestFor(t, user, "", protocol.RequestCommandMux, net.Destination{})
+	request = append(request, makeTestXUDPPayload(t, destination, payload, globalID)...)
+	if _, err := clientTLS.Write(request); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-dispatcher.received:
+		if got.destination != destination || !bytes.Equal(got.payload, payload) {
+			t.Fatalf("destination=%s payload=%x", got.destination, got.payload)
+		}
+		if got.inbound == nil || got.inbound.Name != "vless" || got.inbound.User != user {
+			t.Fatalf("inbound metadata=%+v", got.inbound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("VLESS empty-flow XUDP/443 request was not dispatched")
+	}
+
+	var responseHeader [2]byte
+	if _, err := io.ReadFull(clientTLS, responseHeader[:]); err != nil {
+		t.Fatal(err)
+	}
+	response, err := xudp.NewPacketReader(clientTLS).ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseData := make([]byte, response.Len())
+	response.Copy(responseData)
+	buf.ReleaseMulti(response)
+	if !bytes.Equal(responseData, dispatcher.response) {
+		t.Fatalf("response=%x", responseData)
+	}
+
+	_ = clientTLS.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("VLESS empty-flow XUDP inbound did not stop")
+	}
+	clearTestXUDPAssociation(t, globalID)
+}
+
+func TestVLESSVisionXUDP443OverExistingTLS(t *testing.T) {
+	server, user := testMultiServer(t)
+	server.policyManager = &testPolicyManager{}
+	dispatcher := &vlessUDPTestDispatcher{
+		received: make(chan vlessUDPDispatch, 1),
+		response: []byte("quic-xudp-response"),
+	}
+
+	serverRaw, clientRaw := stdnet.Pipe()
+	serverTLS := xraytls.Server(serverRaw, &gotls.Config{
+		Certificates: []gotls.Certificate{testTLSCertificate(t)}, MinVersion: gotls.VersionTLS13, MaxVersion: gotls.VersionTLS13,
+	}).(*xraytls.Conn)
+	clientTLS := gotls.Client(clientRaw, &gotls.Config{
+		InsecureSkipVerify: true, ServerName: "localhost", MinVersion: gotls.VersionTLS13, MaxVersion: gotls.VersionTLS13,
+	})
+	defer clientTLS.Close()
+	defer serverTLS.Close()
+
+	inbound := &session.Inbound{
+		Source: net.TCPDestination(net.LocalHostIP, 12348),
+		Local:  net.TCPDestination(net.LocalHostIP, 443),
+		Conn:   serverTLS,
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	done := make(chan error, 1)
+	go func() { done <- server.Process(ctx, net.Network_TCP, serverTLS, dispatcher) }()
+
+	destination := net.UDPDestination(net.DomainAddress("quic.example"), 443)
+	payload := []byte{0xc3, 0x00, 0x00, 0x00, 0x01, 'x', 'u', 'd', 'p'}
+	globalID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	id, _, err := userProtocolKeys(user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeID := append([]byte(nil), id[:]...)
+	padded := proxy.XtlsPadding(buf.FromBytes(makeTestXUDPPayload(t, destination, payload, globalID)), proxy.CommandPaddingEnd, &writeID, false, context.Background(), []uint32{900, 1, 900, 1})
+	request := makeVLESSRequestFor(t, user, vlessVisionFlow, protocol.RequestCommandMux, net.Destination{})
+	request = append(request, padded.Bytes()...)
+	padded.Release()
+	if _, err := clientTLS.Write(request); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-dispatcher.received:
+		if got.destination != destination || !bytes.Equal(got.payload, payload) {
+			t.Fatalf("destination=%s payload=%x", got.destination, got.payload)
+		}
+		if got.inbound == nil || got.inbound.Name != "vless" || got.inbound.User != user {
+			t.Fatalf("inbound metadata=%+v", got.inbound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Vision XUDP/443 request was not dispatched")
+	}
+
+	var responseHeader [2]byte
+	if _, err := io.ReadFull(clientTLS, responseHeader[:]); err != nil {
+		t.Fatal(err)
+	}
+	if responseHeader != [2]byte{0, 0} {
+		t.Fatalf("response header=%x", responseHeader)
+	}
+	if err := clientTLS.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	responseSeen := false
+	for frameIndex := range 4 {
+		header := make([]byte, 5)
+		if frameIndex == 0 {
+			header = make([]byte, 21)
+		}
+		if _, err := io.ReadFull(clientTLS, header); err != nil {
+			t.Fatal(err)
+		}
+		if frameIndex == 0 && !bytes.Equal(header[:16], id[:]) {
+			t.Fatalf("response UUID=%x", header[:16])
+		}
+		offset := len(header) - 5
+		contentLength := int(header[offset+1])<<8 | int(header[offset+2])
+		paddingLength := int(header[offset+3])<<8 | int(header[offset+4])
+		response := make([]byte, contentLength+paddingLength)
+		if _, err := io.ReadFull(clientTLS, response); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(response[:contentLength], dispatcher.response) {
+			responseSeen = true
+			break
+		}
+	}
+	if !responseSeen {
+		t.Fatal("mux response did not contain the UDP payload")
+	}
+
+	_ = clientTLS.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Vision XUDP inbound did not stop")
+	}
+	clearTestXUDPAssociation(t, globalID)
 }
 
 func appendAnyTLSFrame(buffer *bytes.Buffer, command byte, streamID uint32, data []byte) {

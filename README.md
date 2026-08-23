@@ -14,8 +14,9 @@
 
 - XrayR 服务端和精简、优化后的 Xray-core 位于同一项目中，编译时直接使用本地 core 源码。
 - 普通 Trojan 节点的同一个 TCP + TLS 端口可同时接受 Trojan、VLESS 和 AnyTLS。
-- 支持 VLESS + TCP + TLS 空 flow。
-- 支持 VLESS + TCP + TLS + `xtls-rprx-vision`，Vision 要求外层 TLS 1.3。
+- 支持 VLESS + TCP/UDP + TLS 空 flow，UDP 使用标准 VLESS 长度分帧。
+- 支持 VLESS + TCP + TLS + `xtls-rprx-vision`；Vision 要求外层 TLS 1.3，UDP 使用 Mux/XUDP。
+- VLESS 两种 flow 均接受 UDP/443（包括 QUIC），服务端不按目标端口过滤。
 - 支持 AnyTLS v1/v2 多路复用；v2 额外支持 SYNACK、心跳及服务端版本协商。
 - AnyTLS UDP 支持 connect 和非 connect 模式，并复用 Xray 的 UDP dispatcher。
 - 三种协议使用面板下发的同一个 UUID，保留用户热更新、流量统计、在线设备限制、用户限速和路由规则。
@@ -33,15 +34,17 @@
 | 客户端协议 | 传输与安全层 | 认证信息 |
 | --- | --- | --- |
 | Trojan | TCP + TLS | UUID 字符串作为密码 |
-| VLESS | TCP + TLS，空 flow | 同一 UUID 的 16 字节形式 |
-| VLESS Vision | TCP + TLS 1.3，`xtls-rprx-vision` | 同一 UUID 的 16 字节形式 |
+| VLESS | TCP/UDP + TLS，空 flow | 同一 UUID 的 16 字节形式 |
+| VLESS Vision | TCP + XUDP + TLS 1.3，`xtls-rprx-vision` | 同一 UUID 的 16 字节形式 |
 | AnyTLS | AnyTLS v1 或 v2 + TLS | `SHA-256(UUID 字符串)`，由客户端自动计算 |
 
 协议识别发生在现有 TLS listener 完成握手后，不会修改证书、SNI、ALPN、cipher suites、TLS 版本策略或后量子协商。
 
 未匹配完整有效凭据的连接不会收到多协议特有响应，原始应用层字节会完整交给 Trojan fallback。协议检测不会根据已登记用户的 VLESS UUID 或 AnyTLS 哈希前缀延长等待，避免形成可逐字节试探用户凭据的时序 oracle。只有已经提供完整有效 AnyTLS 凭据的客户端才会进入版本协商；此后的非法设置会在加密连接内收到 AnyTLS Alert 并关闭，不会把已认证协议头转发给伪装站点。
 
-普通 VLESS 空 flow 不使用 Vision padding，因此代理 HTTPS 时仍具有普通 VLESS TLS-in-TLS 的流量特征；这不会改变 Trojan、AnyTLS、Vision 或 fallback 的行为。VLESS 仅开放 TCP 请求，其他 flow、VLESS UDP 和 VLESS Mux 不受支持。
+普通 VLESS 空 flow 不使用 Vision padding，因此代理 HTTPS 时仍具有普通 VLESS TLS-in-TLS 的流量特征；这不会改变 Trojan、AnyTLS、Vision 或 fallback 的行为。空 flow 支持标准 VLESS TCP、直接 UDP 和 Mux。Vision 支持 TCP，并按照 Xray 的兼容行为只允许 Mux 内的 XUDP，不接受 Vision + 直接 VLESS UDP，也不允许在 Vision Mux 中隐藏 TCP stream。
+
+UDP/443 在服务端没有特殊封锁，QUIC 与其他 UDP 目标使用同一派发、路由和统计路径。官方 Xray 客户端使用 Vision 时，可将客户端账户 flow 配置为 `xtls-rprx-vision-udp443`；客户端会在发送前将它归一化为线上协议中的 `xtls-rprx-vision`，服务端也兼容直接收到两种写法。如果客户端还启用了通用 outbound Mux，其版本可能另有 `xudpProxyUDP443` 开关，应设置为 `allow`，或使用 `skip` 绕过该层后交给 VLESS Vision 自身的 XUDP。其他客户端必须确认其 Vision 实现支持 XUDP 和 UDP/443；仅服务端放行无法绕过客户端自身的发送限制。
 
 AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。客户端新建 stream 的 ID 必须严格递增（无需连续），重复或倒退会在已鉴权的加密会话内返回标准 Alert 并关闭该会话；服务端不限制同时活跃的 stream 数量。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
 
@@ -55,7 +58,7 @@ AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1
 2. 用户信息继续由面板下发 UUID，不需要为不同协议创建多份用户；不同用户必须使用不同 UUID，重复 UUID（包括仅大小写不同的写法）会被拒绝，避免认证和流量归属被覆盖。
 3. XrayR 中使用 `PanelType: "NewV2board"` 和 `NodeType: Trojan`。
 4. 配置本地 TLS 证书和私钥；多协议入口依赖该 Trojan TLS listener。
-5. 客户端根据需要选择 Trojan、VLESS 空 flow、VLESS Vision 或 AnyTLS v1/v2，服务器地址、端口、SNI 和 UUID 保持一致。
+5. 客户端根据需要选择 Trojan、VLESS 空 flow、VLESS Vision 或 AnyTLS v1/v2，服务器地址、端口、SNI 和 UUID 保持一致；Vision 客户端需要按上一节说明启用 XUDP/UDP 443。
 
 示例配置：
 

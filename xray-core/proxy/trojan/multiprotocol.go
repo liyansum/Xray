@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
+	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
@@ -177,6 +178,13 @@ var vlessAddressParser = protocol.NewAddressParser(
 	protocol.PortThenAddress(),
 )
 
+const (
+	vlessVisionFlow       = "xtls-rprx-vision"
+	vlessVisionUDP443Flow = "xtls-rprx-vision-udp443"
+)
+
+var vlessMuxDestination = net.TCPDestination(net.DomainAddress("v1.mux.cool"), 666)
+
 func decodeVLESSFlow(addons []byte) (string, error) {
 	var flow string
 	for len(addons) > 0 {
@@ -203,47 +211,64 @@ func decodeVLESSFlow(addons []byte) (string, error) {
 	return flow, nil
 }
 
-func readVLESSRequest(reader io.Reader, expectedUser *protocol.MemoryUser) ([]byte, net.Destination, string, error) {
+func readVLESSRequest(reader io.Reader, expectedUser *protocol.MemoryUser) ([]byte, net.Destination, string, protocol.RequestCommand, error) {
 	var fixed [17]byte
 	if _, err := io.ReadFull(reader, fixed[:]); err != nil {
-		return nil, net.Destination{}, "", errors.New("failed to read VLESS authentication").Base(err)
+		return nil, net.Destination{}, "", 0, errors.New("failed to read VLESS authentication").Base(err)
 	}
 	if fixed[0] != 0 {
-		return nil, net.Destination{}, "", errors.New("unsupported VLESS version")
+		return nil, net.Destination{}, "", 0, errors.New("unsupported VLESS version")
 	}
 	expectedID, _, err := userProtocolKeys(expectedUser)
 	if err != nil || !bytes.Equal(fixed[1:], expectedID[:]) {
-		return nil, net.Destination{}, "", errors.New("VLESS user changed during authentication")
+		return nil, net.Destination{}, "", 0, errors.New("VLESS user changed during authentication")
 	}
 
 	var addonLength [1]byte
 	if _, err := io.ReadFull(reader, addonLength[:]); err != nil {
-		return nil, net.Destination{}, "", errors.New("failed to read VLESS addons length").Base(err)
+		return nil, net.Destination{}, "", 0, errors.New("failed to read VLESS addons length").Base(err)
 	}
 	addons := make([]byte, int(addonLength[0]))
 	if _, err := io.ReadFull(reader, addons); err != nil {
-		return nil, net.Destination{}, "", errors.New("failed to read VLESS addons").Base(err)
+		return nil, net.Destination{}, "", 0, errors.New("failed to read VLESS addons").Base(err)
 	}
 	flow, err := decodeVLESSFlow(addons)
 	if err != nil {
-		return nil, net.Destination{}, "", err
+		return nil, net.Destination{}, "", 0, err
 	}
-	if flow != "" && flow != "xtls-rprx-vision" {
-		return nil, net.Destination{}, "", errors.New("unsupported VLESS flow: ", flow)
+	switch flow {
+	case "", vlessVisionFlow:
+	case vlessVisionUDP443Flow:
+		// Official Xray clients use this account-side spelling to opt in to
+		// UDP/443, but normalize the flow sent on the wire to regular Vision.
+		// Accepting both forms also keeps older/custom clients interoperable.
+		flow = vlessVisionFlow
+	default:
+		return nil, net.Destination{}, "", 0, errors.New("unsupported VLESS flow: ", flow)
 	}
 
 	var command [1]byte
 	if _, err := io.ReadFull(reader, command[:]); err != nil {
-		return nil, net.Destination{}, "", errors.New("failed to read VLESS command").Base(err)
+		return nil, net.Destination{}, "", 0, errors.New("failed to read VLESS command").Base(err)
 	}
-	if protocol.RequestCommand(command[0]) != protocol.RequestCommandTCP {
-		return nil, net.Destination{}, "", errors.New("VLESS inbound only accepts TCP")
+	requestCommand := protocol.RequestCommand(command[0])
+	if requestCommand == protocol.RequestCommandMux {
+		return append([]byte(nil), fixed[1:]...), vlessMuxDestination, flow, requestCommand, nil
+	}
+	if requestCommand != protocol.RequestCommandTCP && requestCommand != protocol.RequestCommandUDP {
+		return nil, net.Destination{}, "", 0, errors.New("unsupported VLESS command: ", requestCommand)
 	}
 	address, port, err := vlessAddressParser.ReadAddressPort(nil, reader)
 	if err != nil {
-		return nil, net.Destination{}, "", errors.New("failed to read VLESS destination").Base(err)
+		return nil, net.Destination{}, "", 0, errors.New("failed to read VLESS destination").Base(err)
 	}
-	return append([]byte(nil), fixed[1:]...), net.TCPDestination(address, port), flow, nil
+	if requestCommand == protocol.RequestCommandUDP {
+		if flow == vlessVisionFlow {
+			return nil, net.Destination{}, "", 0, errors.New("VLESS Vision UDP must use XUDP over Mux")
+		}
+		return append([]byte(nil), fixed[1:]...), net.UDPDestination(address, port), flow, requestCommand, nil
+	}
+	return append([]byte(nil), fixed[1:]...), net.TCPDestination(address, port), flow, requestCommand, nil
 }
 
 func visionTLSBuffers(iConn stat.Connection) (*bytes.Reader, *bytes.Buffer, error) {
@@ -267,7 +292,7 @@ func visionTLSBuffers(iConn stat.Connection) (*bytes.Reader, *bytes.Buffer, erro
 }
 
 func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn stat.Connection, reader *buf.BufferedReader, user *protocol.MemoryUser, dispatcher routing.Dispatcher) error {
-	userID, destination, flow, err := readVLESSRequest(reader, user)
+	userID, destination, flow, command, err := readVLESSRequest(reader, user)
 	if err != nil {
 		return err
 	}
@@ -276,7 +301,7 @@ func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn s
 	}
 	var input *bytes.Reader
 	var rawInput *bytes.Buffer
-	if flow == "xtls-rprx-vision" {
+	if flow == vlessVisionFlow {
 		input, rawInput, err = visionTLSBuffers(iConn)
 		if err != nil {
 			return err
@@ -288,15 +313,21 @@ func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn s
 	}
 	inbound.Name = "vless"
 	inbound.User = user
-	if flow == "xtls-rprx-vision" {
+	if flow == vlessVisionFlow && command != protocol.RequestCommandMux {
 		inbound.CanSpliceCopy = 2
 	} else {
 		inbound.CanSpliceCopy = 3
 	}
 
-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
-		From: conn.RemoteAddr(), To: destination, Status: log.AccessAccepted, Email: user.Email,
-	})
+	if command != protocol.RequestCommandMux {
+		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+			From: conn.RemoteAddr(), To: destination, Status: log.AccessAccepted, Email: user.Email,
+		})
+	} else if flow == vlessVisionFlow {
+		// Vision carries UDP only through XUDP. Restricting the inner network
+		// prevents a client from hiding ordinary TCP mux streams in Vision.
+		ctx = session.ContextWithAllowedNetwork(ctx, net.Network_UDP)
+	}
 	ctx = policy.ContextWithBufferPolicy(ctx, s.policyManager.ForLevel(user.Level).Buffer)
 
 	bufferedWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
@@ -305,12 +336,34 @@ func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn s
 	}
 	var clientReader buf.Reader = reader
 	var clientWriter buf.Writer = bufferedWriter
-	if flow == "xtls-rprx-vision" {
+	if command == protocol.RequestCommandUDP {
+		clientReader = newVLESSLengthPacketReader(reader)
+		clientWriter = newVLESSMultiLengthPacketWriter(bufferedWriter)
+	}
+	if flow == vlessVisionFlow {
 		trafficState := proxy.NewTrafficState(userID)
-		clientReader = proxy.NewVisionReader(reader, trafficState, true, ctx, conn, input, rawInput, nil)
-		clientWriter = proxy.NewVisionWriter(bufferedWriter, trafficState, false, ctx, conn, nil, nil)
+		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, conn, input, rawInput, nil)
+		visionWriter := proxy.NewVisionWriter(bufferedWriter, trafficState, false, ctx, conn, nil, nil)
+		if command == protocol.RequestCommandMux {
+			clientWriter = &synchronizedVLESSWriter{writer: visionWriter}
+		} else {
+			clientWriter = visionWriter
+		}
 	}
 	bufferedWriter.SetFlushNext()
+
+	if command == protocol.RequestCommandMux {
+		worker, err := mux.NewServerWorker(ctx, dispatcher, &transport.Link{Reader: clientReader, Writer: clientWriter})
+		if err != nil {
+			return errors.New("failed to start VLESS Mux server").Base(err)
+		}
+		defer worker.Close()
+		select {
+		case <-ctx.Done():
+		case <-worker.WaitClosed():
+		}
+		return nil
+	}
 
 	if err := dispatcher.DispatchLink(ctx, destination, &transport.Link{Reader: clientReader, Writer: clientWriter}); err != nil {
 		return errors.New("failed to dispatch VLESS request").Base(err)

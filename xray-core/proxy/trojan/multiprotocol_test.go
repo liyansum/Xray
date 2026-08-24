@@ -903,7 +903,7 @@ func TestAnyTLSWriteMultiBufferCoalescesFrames(t *testing.T) {
 	}()
 
 	var received []byte
-	for _, expectedLength := range []int{65535, len(expected) - 65535} {
+	for _, expectedLength := range []int{anyTLSWriteBatchSize, anyTLSWriteBatchSize, len(expected) - 2*anyTLSWriteBatchSize} {
 		command, streamID, payload := readTestAnyTLSFrame(t, clientConn)
 		if command != anyTLSCmdPSH || streamID != stream.id || len(payload) != expectedLength {
 			t.Fatalf("frame command=%d stream=%d length=%d, want PSH stream=%d length=%d", command, streamID, len(payload), stream.id, expectedLength)

@@ -43,6 +43,7 @@ const (
 
 	anyTLSFrameHeaderSize = 7
 	anyTLSUoTMagic        = "sp.v2.udp-over-tcp.arpa"
+	anyTLSWriteBatchSize  = 32 * 1024
 )
 
 var (
@@ -365,10 +366,10 @@ func (s *anyTLSStream) Write(payload []byte) (int, error) {
 }
 
 // WriteMultiBuffer keeps Xray's stream batches contiguous instead of turning
-// every 8 KiB buffer into an independent AnyTLS/TLS write. A single AnyTLS
-// frame can carry at most 65535 bytes.
+// every 8 KiB buffer into an independent AnyTLS/TLS write. Keep the regular
+// batch aligned with the TLS stream writer and below the 65535-byte PSH limit.
 func (s *anyTLSStream) WriteMultiBuffer(payload buf.MultiBuffer) error {
-	return buf.WriteMultiBufferCoalesced(s, payload, 65535)
+	return buf.WriteMultiBufferCoalesced(s, payload, anyTLSWriteBatchSize)
 }
 
 // deliver follows the official AnyTLS/sing-box stream model: each stream has

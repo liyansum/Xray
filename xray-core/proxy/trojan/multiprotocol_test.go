@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	stdnet "net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -547,14 +549,22 @@ func TestAnyTLSDoesNotCapActiveIncreasingStreams(t *testing.T) {
 	}
 }
 
-func TestAnyTLSSlowStreamDoesNotBlockSession(t *testing.T) {
+func TestAnyTLSSynchronousPipeBackpressuresSession(t *testing.T) {
 	serverConn, clientConn := stdnet.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	slowOpened := make(chan struct{})
+	releaseRead := make(chan struct{})
+	slowConsumed := make(chan struct{})
 	releaseSlow := make(chan struct{})
 	session := newAnyTLSServerSession(ctx, serverConn, serverConn, testActivity{}, func(stream *anyTLSStream) {
 		if stream.id == 1 {
+			close(slowOpened)
+			<-releaseRead
+			payload := make([]byte, len("unread payload"))
+			_, _ = io.ReadFull(stream, payload)
+			close(slowConsumed)
 			<-releaseSlow
 			return
 		}
@@ -569,13 +579,41 @@ func TestAnyTLSSlowStreamDoesNotBlockSession(t *testing.T) {
 		t.Fatalf("unexpected server settings command: %d", command)
 	}
 	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, 1, nil)
+	<-slowOpened
 	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdPSH, 1, []byte("unread payload"))
-	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, 3, nil)
 
-	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	nextFrame := make([]byte, anyTLSFrameHeaderSize)
+	nextFrame[0] = anyTLSCmdSYN
+	binary.BigEndian.PutUint32(nextFrame[1:5], 3)
+	nextWrite := make(chan error, 1)
+	go func() {
+		_, err := clientConn.Write(nextFrame)
+		nextWrite <- err
+	}()
+	select {
+	case err := <-nextWrite:
+		t.Fatalf("session read another frame before the stream consumed PSH: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseRead)
+	select {
+	case <-slowConsumed:
+	case <-time.After(time.Second):
+		t.Fatal("slow stream did not consume its synchronous PSH")
+	}
+	select {
+	case err := <-nextWrite:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session did not resume after the stream consumed PSH")
+	}
+
 	command, streamID, _ := readTestAnyTLSFrame(t, clientConn)
 	if command != anyTLSCmdSYNACK || streamID != 3 {
-		t.Fatalf("slow stream blocked another stream: command=%d stream=%d", command, streamID)
+		t.Fatalf("unexpected resumed stream response: command=%d stream=%d", command, streamID)
 	}
 
 	_ = clientConn.Close()
@@ -587,41 +625,25 @@ func TestAnyTLSSlowStreamDoesNotBlockSession(t *testing.T) {
 	}
 }
 
-func TestAnyTLSReceiveQueueBackpressuresAndReleases(t *testing.T) {
+func TestAnyTLSSynchronousPipeHasNoReceiveQueue(t *testing.T) {
 	serverConn, clientConn := stdnet.Pipe()
 	defer serverConn.Close()
 	defer clientConn.Close()
 	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
 	stream := newAnyTLSStream(1, session)
 
-	const frameSize = 8192
-	for range anyTLSStreamQueuedBytes / frameSize {
-		payload := buf.NewWithSize(8192)
-		payload.Extend(8192)
-		if err := stream.deliver(payload); err != nil {
-			payload.Release()
-			t.Fatalf("failed to fill receive queue: %v", err)
-		}
-	}
-	if got := session.budget.queuedBytes.Load(); got != anyTLSStreamQueuedBytes {
-		t.Fatalf("queued %d bytes, want full limit %d", got, anyTLSStreamQueuedBytes)
-	}
-
-	blockedPayload := buf.NewWithSize(frameSize)
-	blockedPayload.Extend(frameSize)
+	payload := buf.FromBytes(bytes.Repeat([]byte{0x5a}, 8192))
+	defer payload.Release()
 	delivered := make(chan error, 1)
-	go func() { delivered <- stream.deliver(blockedPayload) }()
+	go func() { delivered <- stream.deliver(payload) }()
 	select {
 	case err := <-delivered:
-		if err != nil {
-			blockedPayload.Release()
-		}
 		stream.abortRemote()
-		t.Fatalf("delivery did not apply backpressure: %v", err)
+		t.Fatalf("synchronous delivery returned before a reader consumed it: %v", err)
 	case <-time.After(25 * time.Millisecond):
 	}
 
-	readBuffer := make([]byte, frameSize)
+	readBuffer := make([]byte, payload.Len())
 	if _, err := io.ReadFull(stream, readBuffer); err != nil {
 		stream.abortRemote()
 		t.Fatal(err)
@@ -629,101 +651,199 @@ func TestAnyTLSReceiveQueueBackpressuresAndReleases(t *testing.T) {
 	select {
 	case err := <-delivered:
 		if err != nil {
-			blockedPayload.Release()
 			stream.abortRemote()
-			t.Fatalf("delivery did not resume after queue space was released: %v", err)
+			t.Fatalf("synchronous delivery failed after consumption: %v", err)
 		}
 	case <-time.After(time.Second):
 		stream.abortRemote()
-		t.Fatal("delivery remained blocked after queue space was released")
+		t.Fatal("synchronous delivery remained blocked after consumption")
 	}
-
 	stream.abortRemote()
-	if bytes := session.budget.queuedBytes.Load(); bytes != 0 {
-		t.Fatalf("queue cleanup retained %d bytes", bytes)
-	}
-	if frames := session.budget.queuedFrames.Load(); frames != 0 {
-		t.Fatalf("queue cleanup retained %d frames", frames)
-	}
 }
 
-func TestAnyTLSBudgetBackpressure(t *testing.T) {
-	tests := []struct {
-		name          string
-		sessionBudget *anyTLSBufferBudget
-		globalBudget  *anyTLSBufferBudget
-	}{
-		{name: "session", sessionBudget: newAnyTLSBufferBudget(1, 1)},
-		{name: "global", sessionBudget: newAnyTLSBufferBudget(2, 2), globalBudget: newAnyTLSBufferBudget(1, 1)},
+func TestAnyTLSConcurrentUplinkThroughput(t *testing.T) {
+	const (
+		streamCount    = 8
+		bytesPerStream = 2 * 1024 * 1024
+		frameSize      = 32 * 1024
+	)
+	serverConn, clientConn := stdnet.Pipe()
+	defer clientConn.Close()
+
+	opened := make(chan uint32, streamCount)
+	completed := make(chan error, streamCount)
+	releaseHandlers := make(chan struct{})
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(stream *anyTLSStream) {
+		opened <- stream.id
+		buffer := make([]byte, frameSize)
+		remaining := bytesPerStream
+		for remaining > 0 {
+			length := min(remaining, len(buffer))
+			if _, err := io.ReadFull(stream, buffer[:length]); err != nil {
+				completed <- err
+				return
+			}
+			for _, value := range buffer[:length] {
+				if value != byte(stream.id) {
+					completed <- errors.New("payload crossed AnyTLS streams")
+					return
+				}
+			}
+			remaining -= length
+		}
+		completed <- nil
+		<-releaseHandlers
+	})
+	done := make(chan error, 1)
+	go func() { done <- session.run() }()
+
+	settings := []byte("v=1\nclient=xray-test\npadding-md5=" + anyTLSPaddingMD5)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSettings, 0, settings)
+	for streamID := uint32(1); streamID <= streamCount; streamID++ {
+		writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, streamID, nil)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			serverConn, clientConn := stdnet.Pipe()
-			defer serverConn.Close()
-			defer clientConn.Close()
-			session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {}, test.globalBudget)
-			session.budget = test.sessionBudget
-			if err := session.reserve(1); err != nil {
+	for range streamCount {
+		select {
+		case <-opened:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent AnyTLS stream did not open")
+		}
+	}
+
+	var wireMu sync.Mutex
+	var senders sync.WaitGroup
+	sendErrors := make(chan error, streamCount)
+	for streamID := uint32(1); streamID <= streamCount; streamID++ {
+		senders.Add(1)
+		go func() {
+			defer senders.Done()
+			payload := bytes.Repeat([]byte{byte(streamID)}, frameSize)
+			frame := make([]byte, anyTLSFrameHeaderSize+frameSize)
+			frame[0] = anyTLSCmdPSH
+			binary.BigEndian.PutUint32(frame[1:5], streamID)
+			binary.BigEndian.PutUint16(frame[5:7], frameSize)
+			copy(frame[7:], payload)
+			for sent := 0; sent < bytesPerStream; sent += frameSize {
+				wireMu.Lock()
+				_, err := clientConn.Write(frame)
+				wireMu.Unlock()
+				if err != nil {
+					sendErrors <- err
+					return
+				}
+			}
+		}()
+	}
+	senders.Wait()
+	close(sendErrors)
+	for err := range sendErrors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range streamCount {
+		select {
+		case err := <-completed:
+			if err != nil {
 				t.Fatal(err)
 			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent AnyTLS throughput test timed out")
+		}
+	}
 
-			reserved := make(chan error, 1)
-			go func() { reserved <- session.reserve(1) }()
-			select {
-			case err := <-reserved:
-				session.release(1)
-				t.Fatalf("budget did not apply backpressure: %v", err)
-			case <-time.After(25 * time.Millisecond):
-			}
-
-			session.release(1)
-			select {
-			case err := <-reserved:
-				if err != nil {
-					t.Fatalf("budget reservation did not resume: %v", err)
-				}
-				session.release(1)
-			case <-time.After(time.Second):
-				t.Fatal("budget reservation remained blocked after release")
-			}
-			if bytes := session.budget.queuedBytes.Load(); bytes != 0 {
-				t.Fatalf("session budget retained %d bytes", bytes)
-			}
-			if test.globalBudget != nil && test.globalBudget.queuedBytes.Load() != 0 {
-				t.Fatalf("global budget retained %d bytes", test.globalBudget.queuedBytes.Load())
-			}
-		})
+	_ = clientConn.Close()
+	close(releaseHandlers)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AnyTLS session did not stop after throughput test")
 	}
 }
 
-func TestAnyTLSBudgetWaitStopsWithSession(t *testing.T) {
+func TestAnyTLSConcurrentDownlinkThroughput(t *testing.T) {
+	const (
+		streamCount    = 8
+		bytesPerStream = 2 * 1024 * 1024
+		frameSize      = 32 * 1024
+	)
 	serverConn, clientConn := stdnet.Pipe()
-	defer serverConn.Close()
 	defer clientConn.Close()
-	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
-	session.budget = newAnyTLSBufferBudget(1, 1)
-	if err := session.reserve(1); err != nil {
+
+	opened := make(chan uint32, streamCount)
+	completed := make(chan error, streamCount)
+	start := make(chan struct{})
+	releaseHandlers := make(chan struct{})
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(stream *anyTLSStream) {
+		opened <- stream.id
+		<-start
+		payload := bytes.Repeat([]byte{byte(stream.id)}, frameSize)
+		for sent := 0; sent < bytesPerStream; sent += frameSize {
+			if _, err := stream.Write(payload); err != nil {
+				completed <- err
+				return
+			}
+		}
+		completed <- nil
+		<-releaseHandlers
+	})
+	done := make(chan error, 1)
+	go func() { done <- session.run() }()
+
+	settings := []byte("v=1\nclient=xray-test\npadding-md5=" + anyTLSPaddingMD5)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSettings, 0, settings)
+	for streamID := uint32(1); streamID <= streamCount; streamID++ {
+		writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, streamID, nil)
+	}
+	for range streamCount {
+		select {
+		case <-opened:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent AnyTLS downlink stream did not open")
+		}
+	}
+	close(start)
+	if err := clientConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-
-	stopped := make(chan error, 1)
-	go func() { stopped <- session.reserve(1) }()
-	select {
-	case err := <-stopped:
-		session.release(1)
-		t.Fatalf("budget did not apply backpressure: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
-	session.close()
-	select {
-	case err := <-stopped:
-		if err == nil {
-			t.Fatal("budget wait succeeded after the session closed")
+	received := make(map[uint32]int, streamCount)
+	totalRemaining := streamCount * bytesPerStream
+	for totalRemaining > 0 {
+		command, streamID, payload := readTestAnyTLSFrame(t, clientConn)
+		if command != anyTLSCmdPSH || streamID == 0 || streamID > streamCount {
+			t.Fatalf("unexpected concurrent downlink frame: command=%d stream=%d", command, streamID)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("budget wait did not stop with the session")
+		for _, value := range payload {
+			if value != byte(streamID) {
+				t.Fatalf("payload crossed AnyTLS downlink streams: stream=%d", streamID)
+			}
+		}
+		received[streamID] += len(payload)
+		totalRemaining -= len(payload)
 	}
-	session.release(1)
+	for streamID := uint32(1); streamID <= streamCount; streamID++ {
+		if received[streamID] != bytesPerStream {
+			t.Fatalf("stream %d received %d bytes, want %d", streamID, received[streamID], bytesPerStream)
+		}
+	}
+	for range streamCount {
+		select {
+		case err := <-completed:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent AnyTLS downlink writer did not finish")
+		}
+	}
+
+	_ = clientConn.Close()
+	close(releaseHandlers)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AnyTLS session did not stop after downlink throughput test")
+	}
 }
 
 func TestAnyTLSUoTPacket(t *testing.T) {
@@ -800,7 +920,7 @@ func BenchmarkMultiProtocolDetection(b *testing.B) {
 	}
 }
 
-func BenchmarkAnyTLSStreamQueue(b *testing.B) {
+func BenchmarkAnyTLSSynchronousStreamPipe(b *testing.B) {
 	serverConn, clientConn := stdnet.Pipe()
 	defer serverConn.Close()
 	defer clientConn.Close()
@@ -811,13 +931,20 @@ func BenchmarkAnyTLSStreamQueue(b *testing.B) {
 
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
+	delivered := make(chan error)
+	go func() {
+		for range b.N {
+			frame := buf.FromBytes(payload)
+			err := stream.deliver(frame)
+			frame.Release()
+			delivered <- err
+		}
+	}()
 	for range b.N {
-		frame := buf.NewWithSize(int32(len(payload)))
-		_, _ = frame.Write(payload)
-		if err := stream.deliver(frame); err != nil {
+		if _, err := io.ReadFull(stream, readBuffer); err != nil {
 			b.Fatal(err)
 		}
-		if _, err := io.ReadFull(stream, readBuffer); err != nil {
+		if err := <-delivered; err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -37,7 +37,6 @@ type Server struct {
 	policyManager policy.Manager
 	validator     *Validator
 	multi         multiUserRegistry
-	anyTLSBudget  *anyTLSBufferBudget
 	fallbacks     map[string]map[string]map[string]*Fallback // or nil
 	cone          bool
 }
@@ -50,7 +49,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		validator:     validator,
 		multi:         newMultiUserRegistry(),
-		anyTLSBudget:  newAnyTLSBufferBudget(anyTLSGlobalQueuedBytes, anyTLSGlobalQueuedFrames),
 		cone:          ctx.Value("cone").(bool),
 	}
 	for _, user := range config.Users {

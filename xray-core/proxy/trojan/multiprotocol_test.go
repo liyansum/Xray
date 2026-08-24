@@ -293,9 +293,12 @@ func TestVLESSRequestFlowModes(t *testing.T) {
 	if err != nil || destination != udpDestination || flow != "" || command != protocol.RequestCommandUDP {
 		t.Fatalf("UDP destination=%s flow=%q command=%v err=%v", destination, flow, command, err)
 	}
-	visionUDP := makeVLESSRequestFor(t, user, vlessVisionFlow, protocol.RequestCommandUDP, udpDestination)
-	if _, _, _, _, err := readVLESSRequest(bytes.NewReader(visionUDP), user); err == nil {
-		t.Fatal("Vision direct UDP was accepted instead of requiring XUDP")
+	for _, wireFlow := range []string{vlessVisionFlow, vlessVisionUDP443Flow} {
+		visionUDP := makeVLESSRequestFor(t, user, wireFlow, protocol.RequestCommandUDP, udpDestination)
+		_, destination, flow, command, err := readVLESSRequest(bytes.NewReader(visionUDP), user)
+		if err != nil || destination != udpDestination || flow != vlessVisionFlow || command != protocol.RequestCommandUDP {
+			t.Fatalf("flow=%q UDP destination=%s normalizedFlow=%q command=%v err=%v", wireFlow, destination, flow, command, err)
+		}
 	}
 
 	for _, wireFlow := range []string{vlessVisionFlow, vlessVisionUDP443Flow} {
@@ -739,6 +742,38 @@ func TestAnyTLSUoTPacket(t *testing.T) {
 	}
 	if address.Domain() != "dns.example" || port != 53 || binary.BigEndian.Uint16(length[:]) != 5 || packet.String() != "query" {
 		t.Fatalf("address=%s port=%d length=%d payload=%q", address, port, binary.BigEndian.Uint16(length[:]), packet.String())
+	}
+}
+
+func TestAnyTLSUoTRequestUsesSocksAddressFormat(t *testing.T) {
+	tests := []struct {
+		name        string
+		connect     bool
+		destination net.Destination
+	}{
+		{name: "IPv4", connect: true, destination: net.UDPDestination(net.ParseAddress("192.0.2.1"), 53)},
+		{name: "domain", destination: net.UDPDestination(net.DomainAddress("dns.example"), 5353)},
+		{name: "IPv6", connect: true, destination: net.UDPDestination(net.ParseAddress("2001:db8::1"), 853)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request bytes.Buffer
+			if test.connect {
+				request.WriteByte(1)
+			} else {
+				request.WriteByte(0)
+			}
+			if err := anyTLSAddressParser.WriteAddressPort(&request, test.destination.Address, test.destination.Port); err != nil {
+				t.Fatal(err)
+			}
+			connect, destination, err := readAnyTLSUoTRequest(&request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if connect != test.connect || destination != test.destination || request.Len() != 0 {
+				t.Fatalf("connect=%v destination=%s remaining=%d", connect, destination, request.Len())
+			}
+		})
 	}
 }
 

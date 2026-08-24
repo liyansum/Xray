@@ -274,9 +274,6 @@ func readVLESSRequest(reader io.Reader, expectedUser *protocol.MemoryUser) ([]by
 		return nil, net.Destination{}, "", 0, errors.New("failed to read VLESS destination").Base(err)
 	}
 	if requestCommand == protocol.RequestCommandUDP {
-		if flow == vlessVisionFlow {
-			return nil, net.Destination{}, "", 0, errors.New("VLESS Vision UDP must use XUDP over Mux")
-		}
 		return append([]byte(nil), fixed[1:]...), net.UDPDestination(address, port), flow, requestCommand, nil
 	}
 	return append([]byte(nil), fixed[1:]...), net.TCPDestination(address, port), flow, requestCommand, nil
@@ -335,8 +332,8 @@ func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn s
 			From: conn.RemoteAddr(), To: destination, Status: log.AccessAccepted, Email: user.Email,
 		})
 	} else if flow == vlessVisionFlow {
-		// Vision carries UDP only through XUDP. Restricting the inner network
-		// prevents a client from hiding ordinary TCP mux streams in Vision.
+		// Vision Mux is reserved for XUDP. Direct VLESS UDP uses the regular
+		// length-prefixed body path below instead of entering this Mux worker.
 		ctx = session.ContextWithAllowedNetwork(ctx, net.Network_UDP)
 	}
 	ctx = policy.ContextWithBufferPolicy(ctx, s.policyManager.ForLevel(user.Level).Buffer)
@@ -347,10 +344,6 @@ func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn s
 	}
 	var clientReader buf.Reader = reader
 	var clientWriter buf.Writer = bufferedWriter
-	if command == protocol.RequestCommandUDP {
-		clientReader = newVLESSLengthPacketReader(reader)
-		clientWriter = newVLESSMultiLengthPacketWriter(bufferedWriter)
-	}
 	if flow == vlessVisionFlow {
 		trafficState := proxy.NewTrafficState(userID)
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, conn, input, rawInput, nil)
@@ -360,6 +353,16 @@ func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn s
 		} else {
 			clientWriter = visionWriter
 		}
+	}
+	if command == protocol.RequestCommandUDP {
+		// Vision padding is outside the standard VLESS UDP framing on the wire:
+		// TLS -> Vision unpadding -> uint16 length -> UDP datagram.
+		if flow == vlessVisionFlow {
+			clientReader = newVLESSLengthPacketReader(&buf.BufferedReader{Reader: clientReader})
+		} else {
+			clientReader = newVLESSLengthPacketReader(reader)
+		}
+		clientWriter = newVLESSMultiLengthPacketWriter(clientWriter)
 	}
 	bufferedWriter.SetFlushNext()
 

@@ -679,7 +679,9 @@ func readAnyTLSUoTRequest(reader io.Reader) (bool, net.Destination, error) {
 	if connect[0] > 1 {
 		return false, net.Destination{}, errors.New("invalid UoT connect flag")
 	}
-	address, port, err := anyTLSUoTAddressParser.ReadAddressPort(nil, reader)
+	// The UoT v2 request destination uses the regular SOCKS address format
+	// (01/03/04). Only per-packet addresses use UoT's 00/01/02 format.
+	address, port, err := anyTLSAddressParser.ReadAddressPort(nil, reader)
 	if err != nil {
 		return false, net.Destination{}, err
 	}

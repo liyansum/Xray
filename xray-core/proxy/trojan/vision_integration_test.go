@@ -403,6 +403,116 @@ func TestVLESSWithoutFlowUDP443OverExistingTLS(t *testing.T) {
 	}
 }
 
+func TestVLESSVisionUDP443OverExistingTLS(t *testing.T) {
+	server, user := testMultiServer(t)
+	server.policyManager = &testPolicyManager{}
+	dispatcher := &vlessUDPTestDispatcher{
+		received: make(chan vlessUDPDispatch, 1),
+		response: []byte("vision-quic-response"),
+	}
+
+	serverRaw, clientRaw := stdnet.Pipe()
+	serverTLS := xraytls.Server(serverRaw, &gotls.Config{
+		Certificates: []gotls.Certificate{testTLSCertificate(t)}, MinVersion: gotls.VersionTLS13, MaxVersion: gotls.VersionTLS13,
+	}).(*xraytls.Conn)
+	clientTLS := gotls.Client(clientRaw, &gotls.Config{
+		InsecureSkipVerify: true, ServerName: "localhost", MinVersion: gotls.VersionTLS13, MaxVersion: gotls.VersionTLS13,
+	})
+	defer clientTLS.Close()
+	defer serverTLS.Close()
+
+	inbound := &session.Inbound{
+		Source: net.TCPDestination(net.LocalHostIP, 12350),
+		Local:  net.TCPDestination(net.LocalHostIP, 443),
+		Conn:   serverTLS,
+	}
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	done := make(chan error, 1)
+	go func() { done <- server.Process(ctx, net.Network_TCP, serverTLS, dispatcher) }()
+
+	destination := net.UDPDestination(net.DomainAddress("quic.example"), 443)
+	payload := []byte{0xc3, 0x00, 0x00, 0x00, 0x01, 'v', 'i', 's', 'i', 'o', 'n'}
+	udpBody := binary.BigEndian.AppendUint16(nil, uint16(len(payload)))
+	udpBody = append(udpBody, payload...)
+	id, _, err := userProtocolKeys(user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeID := append([]byte(nil), id[:]...)
+	padded := proxy.XtlsPadding(buf.FromBytes(udpBody), proxy.CommandPaddingEnd, &writeID, false, context.Background(), []uint32{900, 1, 900, 1})
+	request := makeVLESSRequestFor(t, user, vlessVisionFlow, protocol.RequestCommandUDP, destination)
+	request = append(request, padded.Bytes()...)
+	padded.Release()
+	if _, err := clientTLS.Write(request); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-dispatcher.received:
+		if got.destination != destination || !bytes.Equal(got.payload, payload) {
+			t.Fatalf("destination=%s payload=%x", got.destination, got.payload)
+		}
+		if got.inbound == nil || got.inbound.Name != "vless" || got.inbound.User != user || got.inbound.CanSpliceCopy != 2 {
+			t.Fatalf("inbound metadata=%+v", got.inbound)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Vision direct UDP/443 request was not dispatched")
+	}
+
+	var responseHeader [2]byte
+	if _, err := io.ReadFull(clientTLS, responseHeader[:]); err != nil {
+		t.Fatal(err)
+	}
+	if responseHeader != [2]byte{0, 0} {
+		t.Fatalf("response header=%x", responseHeader)
+	}
+	if err := clientTLS.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var responseContent bytes.Buffer
+	expectedLength := -1
+	for frameIndex := range 8 {
+		header := make([]byte, 5)
+		if frameIndex == 0 {
+			header = make([]byte, 21)
+		}
+		if _, err := io.ReadFull(clientTLS, header); err != nil {
+			t.Fatal(err)
+		}
+		if frameIndex == 0 && !bytes.Equal(header[:16], id[:]) {
+			t.Fatalf("response UUID=%x", header[:16])
+		}
+		offset := len(header) - 5
+		contentLength := int(binary.BigEndian.Uint16(header[offset+1 : offset+3]))
+		paddingLength := int(binary.BigEndian.Uint16(header[offset+3 : offset+5]))
+		frame := make([]byte, contentLength+paddingLength)
+		if _, err := io.ReadFull(clientTLS, frame); err != nil {
+			t.Fatal(err)
+		}
+		responseContent.Write(frame[:contentLength])
+		if expectedLength < 0 && responseContent.Len() >= 2 {
+			expectedLength = 2 + int(binary.BigEndian.Uint16(responseContent.Bytes()[:2]))
+		}
+		if expectedLength >= 0 && responseContent.Len() >= expectedLength {
+			break
+		}
+	}
+	response := responseContent.Bytes()
+	if expectedLength != 2+len(dispatcher.response) || len(response) < expectedLength || !bytes.Equal(response[2:expectedLength], dispatcher.response) {
+		t.Fatalf("framed response=%x expected payload=%x", response, dispatcher.response)
+	}
+
+	_ = clientTLS.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Vision direct UDP inbound did not stop")
+	}
+}
+
 func TestVLESSWithoutFlowXUDP443OverExistingTLS(t *testing.T) {
 	server, user := testMultiServer(t)
 	server.policyManager = &testPolicyManager{}
@@ -686,7 +796,7 @@ func TestAnyTLSV1OverExistingTLS(t *testing.T) { testAnyTLSOverExistingTLS(t, 1)
 
 func TestAnyTLSV2OverExistingTLS(t *testing.T) { testAnyTLSOverExistingTLS(t, 2) }
 
-func testAnyTLSUoTOverExistingTLS(t *testing.T, version int) {
+func testAnyTLSUoTOverExistingTLS(t *testing.T, version int, isConnect bool) {
 	server, _ := testMultiServer(t)
 	server.policyManager = &testPolicyManager{}
 	dispatcher := &anyTLSTestDispatcher{received: make(chan []byte, 1), metadata: make(chan *session.Inbound, 1)}
@@ -729,9 +839,18 @@ func testAnyTLSUoTOverExistingTLS(t *testing.T, version int) {
 	if err := anyTLSAddressParser.WriteAddressPort(&streamRequest, net.DomainAddress(anyTLSUoTMagic), 0); err != nil {
 		t.Fatal(err)
 	}
-	streamRequest.WriteByte(1) // UoT connect mode.
-	if err := anyTLSUoTAddressParser.WriteAddressPort(&streamRequest, net.DomainAddress("dns.example"), 53); err != nil {
+	if isConnect {
+		streamRequest.WriteByte(1)
+	} else {
+		streamRequest.WriteByte(0)
+	}
+	if err := anyTLSAddressParser.WriteAddressPort(&streamRequest, net.DomainAddress("dns.example"), 53); err != nil {
 		t.Fatal(err)
+	}
+	if !isConnect {
+		if err := anyTLSUoTAddressParser.WriteAddressPort(&streamRequest, net.DomainAddress("dns.example"), 53); err != nil {
+			t.Fatal(err)
+		}
 	}
 	streamRequest.Write([]byte{0, 5})
 	streamRequest.WriteString("query")
@@ -750,6 +869,20 @@ func testAnyTLSUoTOverExistingTLS(t *testing.T, version int) {
 	command, streamID, data := readTestAnyTLSFrame(t, clientTLS)
 	if command != anyTLSCmdPSH || streamID != 1 || len(data) < 2 {
 		t.Fatalf("unexpected UoT response frame: command=%d stream=%d data=%x", command, streamID, data)
+	}
+	if !isConnect {
+		address, port, err := anyTLSUoTAddressParser.ReadAddressPort(nil, bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var addressBytes bytes.Buffer
+		if err := anyTLSUoTAddressParser.WriteAddressPort(&addressBytes, address, port); err != nil {
+			t.Fatal(err)
+		}
+		data = data[addressBytes.Len():]
+		if address.Domain() != "dns.example" || port != 53 {
+			t.Fatalf("unexpected UoT response destination: %s:%d", address, port)
+		}
 	}
 	length := int(binary.BigEndian.Uint16(data[:2]))
 	if length != len(data)-2 || string(data[2:]) != "anytls-response" {
@@ -773,9 +906,15 @@ func testAnyTLSUoTOverExistingTLS(t *testing.T, version int) {
 	}
 }
 
-func TestAnyTLSV1UoTOverExistingTLS(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 1) }
+func TestAnyTLSV1UoTOverExistingTLS(t *testing.T) {
+	t.Run("connect", func(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 1, true) })
+	t.Run("packet", func(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 1, false) })
+}
 
-func TestAnyTLSV2UoTOverExistingTLS(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 2) }
+func TestAnyTLSV2UoTOverExistingTLS(t *testing.T) {
+	t.Run("connect", func(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 2, true) })
+	t.Run("packet", func(t *testing.T) { testAnyTLSUoTOverExistingTLS(t, 2, false) })
+}
 
 func testMultiProtocolFallback(t *testing.T, payload []byte) {
 	t.Helper()

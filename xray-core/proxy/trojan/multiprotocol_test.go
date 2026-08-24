@@ -986,6 +986,46 @@ func TestAnyTLSReadMultiBufferPreservesHeaderRemainder(t *testing.T) {
 	stream.abortRemote()
 }
 
+func TestAnyTLSUplinkFramePoolClasses(t *testing.T) {
+	regularExpected := bytes.Repeat([]byte{0x39}, anyTLSFrameBufferSize)
+	regular, regularStorage, err := readAnyTLSFramePayload(bytes.NewReader(regularExpected), len(regularExpected))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regularStorage != nil {
+		regular.Release()
+		anyTLSLargeFramePool.Put(regularStorage)
+		t.Fatal("32 KiB AnyTLS uplink frame unexpectedly used the large-frame pool")
+	}
+	if capacity := cap(regular.Bytes()); capacity != anyTLSFrameBufferSize {
+		regular.Release()
+		t.Fatalf("regular AnyTLS uplink frame has capacity %d, want %d", capacity, anyTLSFrameBufferSize)
+	}
+	regular.Release()
+
+	expected := bytes.Repeat([]byte{0x6a}, 65535)
+	payload, storage, err := readAnyTLSFramePayload(bytes.NewReader(expected), len(expected))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storage == nil {
+		payload.Release()
+		t.Fatal("large AnyTLS uplink frame did not use the dedicated pool")
+	}
+	if capacity := cap(payload.Bytes()); capacity != anyTLSLargeFrameSize {
+		payload.Release()
+		anyTLSLargeFramePool.Put(storage)
+		t.Fatalf("large AnyTLS uplink frame has capacity %d, want %d", capacity, anyTLSLargeFrameSize)
+	}
+	if !bytes.Equal(payload.Bytes(), expected) {
+		payload.Release()
+		anyTLSLargeFramePool.Put(storage)
+		t.Fatal("large AnyTLS uplink frame changed payload contents")
+	}
+	payload.Release()
+	anyTLSLargeFramePool.Put(storage)
+}
+
 func TestAnyTLSConcurrentUplinkThroughput(t *testing.T) {
 	const (
 		streamCount    = 8

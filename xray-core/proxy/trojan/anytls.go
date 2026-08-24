@@ -45,6 +45,7 @@ const (
 	anyTLSFrameHeaderSize  = 7
 	anyTLSFrameBufferSize  = 32 * 1024
 	anyTLSFramePayloadSize = anyTLSFrameBufferSize - anyTLSFrameHeaderSize
+	anyTLSLargeFrameSize   = 64 * 1024
 	anyTLSUoTMagic         = "sp.v2.udp-over-tcp.arpa"
 	anyTLSReadBatchSize    = 32 * 1024
 	anyTLSControlTimeout   = 5 * time.Second
@@ -56,7 +57,11 @@ var (
 		sum := md5.Sum(anyTLSPaddingScheme)
 		return hex.EncodeToString(sum[:])
 	}()
-	anyTLSAddressParser = protocol.NewAddressParser(
+	// Xray's general bytespool jumps from 32 KiB to 128 KiB. AnyTLS wire
+	// payloads are uint16-sized, so use the same 64 KiB receive class as the
+	// official AnyTLS/sing allocator instead of wasting half of a 128 KiB slab.
+	anyTLSLargeFramePool = sync.Pool{New: func() any { return new([anyTLSLargeFrameSize]byte) }}
+	anyTLSAddressParser  = protocol.NewAddressParser(
 		protocol.AddressFamilyByte(0x01, net.AddressFamilyIPv4),
 		protocol.AddressFamilyByte(0x04, net.AddressFamilyIPv6),
 		protocol.AddressFamilyByte(0x03, net.AddressFamilyDomain),
@@ -137,6 +142,25 @@ func newAnyTLSServerSession(_ context.Context, conn stat.Connection, reader io.R
 	}
 }
 
+func readAnyTLSFramePayload(reader io.Reader, length int) (*buf.Buffer, *[anyTLSLargeFrameSize]byte, error) {
+	if length > anyTLSFrameBufferSize {
+		storage := anyTLSLargeFramePool.Get().(*[anyTLSLargeFrameSize]byte)
+		payload := storage[:length]
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			anyTLSLargeFramePool.Put(storage)
+			return nil, nil, err
+		}
+		return buf.FromBytes(payload), storage, nil
+	}
+
+	payload := buf.NewWithSize(int32(length))
+	if _, err := payload.ReadFullFrom(reader, int32(length)); err != nil {
+		payload.Release()
+		return nil, nil, err
+	}
+	return payload, nil, nil
+}
+
 func (s *anyTLSServerSession) run() error {
 	defer func() {
 		s.close()
@@ -155,11 +179,12 @@ func (s *anyTLSServerSession) run() error {
 		streamID := binary.BigEndian.Uint32(header[1:5])
 		length := int(binary.BigEndian.Uint16(header[5:7]))
 		var frameData *buf.Buffer
+		var largeFrameData *[anyTLSLargeFrameSize]byte
 		var data []byte
 		if length != 0 {
-			frameData = buf.NewWithSize(int32(length))
-			if _, err := frameData.ReadFullFrom(s.reader, int32(length)); err != nil {
-				frameData.Release()
+			var err error
+			frameData, largeFrameData, err = readAnyTLSFramePayload(s.reader, length)
+			if err != nil {
 				return errors.New("failed to read AnyTLS frame payload").Base(err)
 			}
 			data = frameData.Bytes()
@@ -209,6 +234,9 @@ func (s *anyTLSServerSession) run() error {
 		}()
 		if frameData != nil {
 			frameData.Release()
+		}
+		if largeFrameData != nil {
+			anyTLSLargeFramePool.Put(largeFrameData)
 		}
 		if frameErr != nil {
 			return frameErr

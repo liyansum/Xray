@@ -180,6 +180,23 @@ func TestRateReaderSplitsWithoutLosingData(t *testing.T) {
 	}
 }
 
+func TestPacketRateWriterPreservesDatagramBoundaries(t *testing.T) {
+	first := []byte("first-datagram")
+	second := []byte("second")
+	container := new(buf.MultiBufferContainer)
+	writer := New().RatePacketWriter(context.Background(), container, rate.NewLimiter(rate.Inf, 4))
+	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(first), buf.FromBytes(second)}); err != nil {
+		t.Fatal(err)
+	}
+	defer container.Close()
+	if len(container.MultiBuffer) != 2 {
+		t.Fatalf("rate limiter changed two datagrams into %d buffers", len(container.MultiBuffer))
+	}
+	if !bytes.Equal(container.MultiBuffer[0].Bytes(), first) || !bytes.Equal(container.MultiBuffer[1].Bytes(), second) {
+		t.Fatal("rate limiter changed UDP payloads")
+	}
+}
+
 func TestUserRateBucketIsSharedAcrossConnections(t *testing.T) {
 	users := []api.UserInfo{{UID: 1, Email: "user@example.com", SpeedLimit: 1024}}
 	limiter := New()
@@ -194,6 +211,22 @@ func TestUserRateBucketIsSharedAcrossConnections(t *testing.T) {
 	second, limited, reject := limiter.GetUserBucket("node", email, "192.0.2.2", true)
 	if reject || !limited || second != first {
 		t.Fatalf("second connection did not share the user bucket: limited=%v reject=%v", limited, reject)
+	}
+}
+
+func TestUnknownUserDoesNotCreateDeviceState(t *testing.T) {
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com", DeviceLimit: 1}}
+	limiter := New()
+	if err := limiter.AddInboundLimiter("node", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, reject := limiter.GetUserBucket("node", "removed@example.com", "192.0.2.1", true); reject {
+		t.Fatal("unknown user was rejected by stale limiter state")
+	}
+	value, _ := limiter.InboundInfo.Load("node")
+	inbound := value.(*InboundInfo)
+	if _, found := inbound.userDevices.Load("removed@example.com"); found {
+		t.Fatal("unknown user created persistent device state")
 	}
 }
 

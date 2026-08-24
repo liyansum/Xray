@@ -30,7 +30,7 @@ func TestCompactDomainMatcher_PreservesCustomRuleIndices(t *testing.T) {
 }
 
 func TestCompactDomainMatcher_PreservesMixedRuleIndices(t *testing.T) {
-	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	t.Setenv("xray.location.asset", filepath.Join("..", "..", "..", "release", "config"))
 
 	factory := &CompactDomainMatcherFactory{shared: utils.NewWeakCacheMap[string, strmatcher.LinearAnyMatcher]()}
 	matcher, err := factory.BuildMatcher([]*DomainRule{

@@ -82,7 +82,12 @@ func ReadLocalRuleList(path string) []DetectRule {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		rules = append(rules, DetectRule{ID: -1, Pattern: regexp.MustCompile(scanner.Text())})
+		pattern, err := regexp.Compile(scanner.Text())
+		if err != nil {
+			log.Printf("Ignoring invalid rule pattern: %s", err)
+			continue
+		}
+		rules = append(rules, DetectRule{ID: -1, Pattern: pattern})
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("Error while reading rule file: %s", err)

@@ -67,7 +67,7 @@ func TestCheckResponseRedactsCredentials(t *testing.T) {
 
 func TestReadLocalRuleList(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rules.txt")
-	if err := os.WriteFile(path, []byte("example\\.com\nblocked\\.test\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("example\\.com\n[invalid\nblocked\\.test\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	rules := ReadLocalRuleList(path)

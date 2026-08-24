@@ -207,10 +207,13 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 
 	for i := range routes {
 		if routes[i].Action == "block" {
-
+			pattern, err := regexp.Compile(strings.Join(routes[i].Match, "|"))
+			if err != nil {
+				return nil, fmt.Errorf("compile block route %d: %w", i, err)
+			}
 			ruleList = append(ruleList, api.DetectRule{
 				ID:      i,
-				Pattern: regexp.MustCompile(strings.Join(routes[i].Match, "|")),
+				Pattern: pattern,
 			})
 		}
 	}

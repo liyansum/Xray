@@ -48,6 +48,8 @@ UDP/443 在服务端没有特殊封锁，QUIC 与其他 UDP 目标使用同一�
 
 AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。客户端新建 stream 的 ID 必须严格递增（无需连续），重复或倒退会在已鉴权的加密会话内返回标准 Alert 并关闭该会话；服务端不限制同时活跃的 stream 数量。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
 
+AnyTLS 接收端为每条 stream 使用独立的非阻塞队列，慢目标不会阻塞同一 TLS 会话中的其他 stream。队列按底层缓冲区的真实分配容量计费，单 stream 最多缓存 256 KiB/64 帧、单会话最多 2 MiB/512 帧、单个入站实例合计最多 32 MiB/8192 帧；达到窗口时只关闭对应 stream（v2 会在加密会话内返回带错误的 SYNACK）。这些是待处理数据的内存窗口，不是活跃 stream 数量限制。用户限速在 UDP 路径上按完整数据报等待令牌，不会为了适配令牌桶 burst 而拆分游戏或 QUIC 数据报。
+
 ## 面板与节点配置
 
 ### 修改版 V2board
@@ -180,19 +182,20 @@ cd Xray
 GOAMD64=v1 ./build.sh
 ```
 
-只编译全部服务包和测试源码、不执行可能访问面板的测试：
+运行不依赖外部面板的默认测试：
 
 ```bash
-go test -run '^$' ./...
+go test ./...
+go test -race ./...
 ```
 
-验证内置核心和多协议入口：
+旧面板的手工联调测试使用 `integration` build tag，默认不会访问本机或外部面板。验证内置核心和多协议入口：
 
 ```bash
 cd xray-core
-go test ./proxy ./proxy/trojan
-go test -race ./proxy/trojan
-go vet ./proxy ./proxy/trojan
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
 ## Release workflow

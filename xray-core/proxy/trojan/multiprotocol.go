@@ -42,12 +42,14 @@ var errNeedMoreData = errors.New("need more protocol authentication data")
 
 type multiUserRegistry struct {
 	mu     sync.RWMutex
+	trojan map[[userHashSize]byte]*protocol.MemoryUser
 	vless  map[[16]byte]*protocol.MemoryUser
 	anytls map[[32]byte]*protocol.MemoryUser
 }
 
 func newMultiUserRegistry() multiUserRegistry {
 	return multiUserRegistry{
+		trojan: make(map[[userHashSize]byte]*protocol.MemoryUser),
 		vless:  make(map[[16]byte]*protocol.MemoryUser),
 		anytls: make(map[[32]byte]*protocol.MemoryUser),
 	}
@@ -74,14 +76,18 @@ func (s *Server) addUser(user *protocol.MemoryUser) error {
 	if err != nil {
 		return err
 	}
+	account := user.Account.(*MemoryAccount)
+	var trojanKey [userHashSize]byte
+	copy(trojanKey[:], account.Key)
 	s.multi.mu.Lock()
 	defer s.multi.mu.Unlock()
-	if s.multi.vless[vlessKey] != nil || s.multi.anytls[anyTLSKey] != nil {
+	if s.multi.trojan[trojanKey] != nil || s.multi.vless[vlessKey] != nil || s.multi.anytls[anyTLSKey] != nil {
 		return errors.New("multi-protocol user UUID already exists")
 	}
 	if err := s.validator.Add(user); err != nil {
 		return err
 	}
+	s.multi.trojan[trojanKey] = user
 	s.multi.vless[vlessKey] = user
 	s.multi.anytls[anyTLSKey] = user
 	return nil
@@ -101,6 +107,9 @@ func (s *Server) removeUser(email string) error {
 	if err := s.validator.Del(email); err != nil {
 		return err
 	}
+	var trojanKey [userHashSize]byte
+	copy(trojanKey[:], user.Account.(*MemoryAccount).Key)
+	delete(s.multi.trojan, trojanKey)
 	delete(s.multi.vless, vlessKey)
 	delete(s.multi.anytls, anyTLSKey)
 	return nil
@@ -118,7 +127,9 @@ func (s *Server) detectProtocol(data []byte) (inboundProtocol, *protocol.MemoryU
 		}
 	}
 	if len(data) >= userHashCRLF && data[userHashSize] == '\r' && data[userHashSize+1] == '\n' {
-		if user := s.validator.Get(string(data[:userHashSize])); user != nil {
+		var key [userHashSize]byte
+		copy(key[:], data[:userHashSize])
+		if user := s.multi.trojan[key]; user != nil {
 			return inboundTrojan, user, nil
 		}
 	}

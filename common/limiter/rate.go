@@ -23,6 +23,18 @@ type Reader struct {
 	pendingErr error
 }
 
+type PacketReader struct {
+	reader  buf.Reader
+	limiter *rate.Limiter
+	ctx     context.Context
+}
+
+type PacketWriter struct {
+	writer  buf.Writer
+	limiter *rate.Limiter
+	ctx     context.Context
+}
+
 func limiterChunkSize(limiter *rate.Limiter) (int32, error) {
 	burst := limiter.Burst()
 	if burst <= 0 {
@@ -55,6 +67,65 @@ func (l *Limiter) RateReader(ctx context.Context, reader buf.Reader, limiter *ra
 		ctx:     ctx,
 	}
 }
+
+// RatePacketReader limits bytes while preserving the invariant that every
+// Buffer is one UDP datagram. A datagram may be larger than the limiter burst;
+// tokens are then acquired in chunks before the intact packet is returned.
+func (l *Limiter) RatePacketReader(ctx context.Context, reader buf.Reader, limiter *rate.Limiter) buf.Reader {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &PacketReader{reader: reader, limiter: limiter, ctx: ctx}
+}
+
+// RatePacketWriter is the packet-preserving counterpart of RateWriter.
+func (l *Limiter) RatePacketWriter(ctx context.Context, writer buf.Writer, limiter *rate.Limiter) buf.Writer {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &PacketWriter{writer: writer, limiter: limiter, ctx: ctx}
+}
+
+func waitBytes(ctx context.Context, limiter *rate.Limiter, size int32) error {
+	chunkSize, err := limiterChunkSize(limiter)
+	if err != nil {
+		return err
+	}
+	for size > 0 {
+		chunk := min(size, chunkSize)
+		if err := limiter.WaitN(ctx, int(chunk)); err != nil {
+			return err
+		}
+		size -= chunk
+	}
+	return nil
+}
+
+func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.reader.ReadMultiBuffer()
+	if mb.IsEmpty() {
+		return mb, err
+	}
+	if waitErr := waitBytes(r.ctx, r.limiter, mb.Len()); waitErr != nil {
+		buf.ReleaseMulti(mb)
+		return nil, waitErr
+	}
+	return mb, err
+}
+
+func (r *PacketReader) Close() error { return common.Close(r.reader) }
+
+func (r *PacketReader) Interrupt() { common.Interrupt(r.reader) }
+
+func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if waitErr := waitBytes(w.ctx, w.limiter, mb.Len()); waitErr != nil {
+		buf.ReleaseMulti(mb)
+		return waitErr
+	}
+	return w.writer.WriteMultiBuffer(mb)
+}
+
+func (w *PacketWriter) Close() error { return common.Close(w.writer) }
 
 func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	mb := r.pending

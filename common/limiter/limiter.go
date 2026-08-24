@@ -75,6 +75,7 @@ type InboundInfo struct {
 		config         *GlobalDeviceLimitConfig
 		globalOnlineIP *marshaler.Marshaler
 		redisClient    *redis.Client
+		keyLocks       sync.Map // key: cache key, value: *sync.Mutex
 	}
 	aliveList    atomic.Pointer[map[int]int]                 // Key: Uid, value: alive_ip
 	oldOnlineSet atomic.Pointer[map[deviceIdentity]struct{}] // Previous reporting period
@@ -188,6 +189,7 @@ func (i *InboundInfo) updateUsers(tag string, users []api.UserInfo) {
 func (i *InboundInfo) removeUsers(emails []string) {
 	removed := make(map[string]struct{}, len(emails))
 	removedUIDs := make(map[int]struct{}, len(emails))
+	removedGlobalKeys := make(map[string]struct{}, len(emails))
 	for _, email := range emails {
 		removed[email] = struct{}{}
 	}
@@ -200,6 +202,7 @@ func (i *InboundInfo) removeUsers(emails []string) {
 		for email, info := range *current {
 			if _, found := removed[email]; found {
 				removedUIDs[info.UID] = struct{}{}
+				removedGlobalKeys[strings.Replace(email, i.Tag, strconv.Itoa(info.DeviceLimit), 1)] = struct{}{}
 				continue
 			}
 			next[email] = info
@@ -211,6 +214,9 @@ func (i *InboundInfo) removeUsers(emails []string) {
 	for email := range removed {
 		i.BucketHub.Delete(email)
 		i.userDevices.Delete(email)
+	}
+	for key := range removedGlobalKeys {
+		i.GlobalLimit.keyLocks.Delete(key)
 	}
 	for {
 		current := i.oldOnlineSet.Load()
@@ -359,6 +365,7 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP
 		var (
 			userLimit        uint64 = 0
 			deviceLimit, uid int
+			knownUser        bool
 		)
 
 		inboundInfo := value.(*InboundInfo)
@@ -368,6 +375,7 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP
 		if users != nil {
 			u, ok := (*users)[email]
 			if ok {
+				knownUser = true
 				uid = u.UID
 				userLimit = u.SpeedLimit
 				deviceLimit = u.DeviceLimit
@@ -377,12 +385,12 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP
 		// Device limits apply only to TCP source connections. The user-specific
 		// state makes admission atomic while allowing unrelated users to connect
 		// concurrently.
-		if isSourceTCP && inboundInfo.registerDevice(email, uid, ip, deviceLimit) {
+		if knownUser && isSourceTCP && inboundInfo.registerDevice(email, uid, ip, deviceLimit) {
 			return nil, false, true
 		}
 
 		// GlobalLimit
-		if deviceLimit > 0 && inboundInfo.GlobalLimit.config != nil && inboundInfo.GlobalLimit.config.Enable {
+		if knownUser && deviceLimit > 0 && inboundInfo.GlobalLimit.config != nil && inboundInfo.GlobalLimit.config.Enable {
 			if reject := globalLimit(inboundInfo, email, uid, ip, deviceLimit); reject {
 				return nil, false, true
 			}
@@ -408,35 +416,45 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP
 
 // Global device limit
 func globalLimit(inboundInfo *InboundInfo, email string, uid int, ip string, deviceLimit int) bool {
+	// reformat email for unique key
+	uniqueKey := strings.Replace(email, inboundInfo.Tag, strconv.Itoa(deviceLimit), 1)
+	lockValue, _ := inboundInfo.GlobalLimit.keyLocks.LoadOrStore(uniqueKey, new(sync.Mutex))
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(inboundInfo.GlobalLimit.config.Timeout)*time.Second)
 	defer cancel()
-
-	// reformat email for unique key
-	uniqueKey := strings.Replace(email, inboundInfo.Tag, strconv.Itoa(deviceLimit), 1)
 
 	v, err := inboundInfo.GlobalLimit.globalOnlineIP.Get(ctx, uniqueKey, new(map[string]int))
 	if err != nil {
 		if _, ok := err.(*store.NotFound); ok {
 			// If the email is a new device
-			go pushIP(inboundInfo, uniqueKey, &map[string]int{ip: uid})
+			pushIP(inboundInfo, uniqueKey, &map[string]int{ip: uid})
 		} else {
 			log.Error("cache service", err)
 		}
 		return false
 	}
 
-	ipMap := v.(*map[string]int)
-	// Reject device reach limit directly
-	if deviceLimit > 0 && len(*ipMap) > deviceLimit {
+	cached := *v.(*map[string]int)
+	if _, ok := cached[ip]; ok {
+		return false
+	}
+	// The candidate IP itself consumes the next slot, so equality is already
+	// full. The old strict-greater check admitted one device too many.
+	if deviceLimit > 0 && len(cached) >= deviceLimit {
 		return true
 	}
 
-	// If the ip is not in cache
-	if _, ok := (*ipMap)[ip]; !ok {
-		(*ipMap)[ip] = uid
-		go pushIP(inboundInfo, uniqueKey, ipMap)
+	// Never mutate a map owned by a cache implementation. A copy avoids data
+	// races with readers and is published before releasing this user's lock.
+	ipMap := make(map[string]int, len(cached)+1)
+	for cachedIP, cachedUID := range cached {
+		ipMap[cachedIP] = cachedUID
 	}
+	ipMap[ip] = uid
+	pushIP(inboundInfo, uniqueKey, &ipMap)
 
 	return false
 }

@@ -29,4 +29,7 @@ func TestUnregisterUserCounters(t *testing.T) {
 		manager.GetCounter("user>>>"+email+">>>traffic>>>downlink") != nil {
 		t.Fatal("user traffic counters remain registered")
 	}
+	if err := controller.unregisterUserCounters(email); err != nil {
+		t.Fatalf("removing absent counters is not idempotent: %v", err)
+	}
 }

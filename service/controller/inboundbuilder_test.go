@@ -7,7 +7,7 @@ import (
 	. "github.com/liyansum/Xray/service/controller"
 )
 
-func TestBuildV2ray(t *testing.T) {
+func TestRejectUnsupportedV2rayNode(t *testing.T) {
 	nodeInfo := &api.NodeInfo{
 		NodeType:          "V2ray",
 		NodeID:            1,
@@ -20,9 +20,8 @@ func TestBuildV2ray(t *testing.T) {
 		EnableTLS:         false,
 	}
 	config := &Config{}
-	_, err := InboundBuilder(config, nodeInfo, "test_tag")
-	if err != nil {
-		t.Error(err)
+	if _, err := InboundBuilder(config, nodeInfo, "test_tag"); err == nil {
+		t.Fatal("unsupported V2ray node was accepted")
 	}
 }
 

@@ -391,7 +391,7 @@ func TestIPMatcherFilterIPs(t *testing.T) {
 }
 
 func TestIPMatcher4CN(t *testing.T) {
-	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	t.Setenv("xray.location.asset", filepath.Join("..", "..", "..", "release", "config"))
 
 	matcher := buildIPMatcher("geoip:cn")
 
@@ -401,7 +401,7 @@ func TestIPMatcher4CN(t *testing.T) {
 }
 
 func TestIPMatcher6US(t *testing.T) {
-	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	t.Setenv("xray.location.asset", filepath.Join("..", "..", "..", "release", "config"))
 
 	matcher := buildIPMatcher("geoip:us")
 
@@ -411,7 +411,7 @@ func TestIPMatcher6US(t *testing.T) {
 }
 
 func BenchmarkIPMatcher4CN(b *testing.B) {
-	b.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	b.Setenv("xray.location.asset", filepath.Join("..", "..", "..", "release", "config"))
 
 	matcher := buildIPMatcher("geoip:cn")
 	ip := net.IP{8, 8, 8, 8}
@@ -424,7 +424,7 @@ func BenchmarkIPMatcher4CN(b *testing.B) {
 }
 
 func BenchmarkIPMatcher6US(b *testing.B) {
-	b.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	b.Setenv("xray.location.asset", filepath.Join("..", "..", "..", "release", "config"))
 
 	matcher := buildIPMatcher("geoip:us")
 	ip := xnet.ParseAddress("2001:4860:4860::8888").IP()

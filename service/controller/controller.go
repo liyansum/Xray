@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -29,6 +30,7 @@ type LimitInfo struct {
 }
 
 type Controller struct {
+	monitorMu    sync.Mutex
 	server       *core.Instance
 	config       *Config
 	clientInfo   api.ClientInfo
@@ -93,7 +95,6 @@ func (c *Controller) Start() error {
 	// Add new tag
 	err = c.addNewTag(newNodeInfo)
 	if err != nil {
-		c.logger.Panic(err)
 		return err
 	}
 	// Update user
@@ -162,7 +163,12 @@ func (c *Controller) Start() error {
 	// Start periodic tasks
 	for i := range c.tasks {
 		c.logger.Printf("Start %s periodic task", c.tasks[i].tag)
-		go c.tasks[i].Start()
+		periodic := &c.tasks[i]
+		go func() {
+			if err := periodic.Start(); err != nil {
+				c.logger.Printf("%s periodic task stopped: %s", periodic.tag, err)
+			}
+		}()
 	}
 
 	return nil
@@ -178,8 +184,13 @@ func (c *Controller) Close() error {
 			}
 		}
 	}
+	// Periodic.Close prevents the next run but does not wait for an Execute that
+	// is already in progress. Wait for it before tearing down shared state.
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
 	if c.Tag != "" {
 		closeErr = errors.Join(closeErr, c.DeleteInboundLimiter(c.Tag))
+		c.dispatcher.RuleManager.RemoveRule(c.Tag)
 	}
 	if c.userList != nil {
 		for _, user := range *c.userList {
@@ -194,6 +205,8 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
 	}
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
 
 	// First fetch Node Info
 	var nodeInfoChanged = true
@@ -303,11 +316,13 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				deletedEmail := make([]string, len(deleted))
 				for i, u := range deleted {
 					deletedEmail[i] = fmt.Sprintf("%s|%s|%d", c.Tag, u.Email, u.UID)
+					delete(c.limitedUsers, u)
+					delete(c.warnedUsers, u)
 				}
-				err := c.removeUsers(deletedEmail, c.Tag)
-				if err != nil {
+				if err := c.removeUsers(deletedEmail, c.Tag); err != nil {
 					c.logger.Print(err)
-				} else if err := c.RemoveInboundLimiterUsers(c.Tag, deletedEmail); err != nil {
+				}
+				if err := c.RemoveInboundLimiterUsers(c.Tag, deletedEmail); err != nil {
 					c.logger.Print(err)
 				}
 			}
@@ -337,6 +352,7 @@ func (c *Controller) removeOldTag(oldTag string) (err error) {
 	if err != nil {
 		return err
 	}
+	c.dispatcher.RuleManager.RemoveRule(oldTag)
 	return nil
 }
 
@@ -345,26 +361,21 @@ func (c *Controller) addNewTag(newNodeInfo *api.NodeInfo) (err error) {
 	if err != nil {
 		return err
 	}
-	err = c.addInbound(inboundConfig)
+	outboundConfig, err := OutboundBuilder(c.config, newNodeInfo, c.Tag)
 	if err != nil {
-
 		return err
 	}
-	outBoundConfig, err := OutboundBuilder(c.config, newNodeInfo, c.Tag)
-	if err != nil {
-
+	if err := c.addInbound(inboundConfig); err != nil {
 		return err
 	}
-	err = c.addOutbound(outBoundConfig)
-	if err != nil {
-
-		return err
+	if err := c.addOutbound(outboundConfig); err != nil {
+		return errors.Join(err, c.removeInbound(c.Tag))
 	}
 	return nil
 }
 
 func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo) (err error) {
-	users := make([]*protocol.User, 0)
+	var users []*protocol.User
 	switch nodeInfo.NodeType {
 	case "Trojan":
 		users = c.buildTrojanUser(userInfo)
@@ -383,36 +394,21 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 }
 
 func compareUserList(old, new *[]api.UserInfo) (deleted, added []api.UserInfo) {
-	mSrc := make(map[api.UserInfo]byte) // 按源数组建索引
-	mAll := make(map[api.UserInfo]byte) // 源+目所有元素建索引
-
-	var set []api.UserInfo // 交集
-
-	// 1.源数组建立map
+	oldSet := make(map[api.UserInfo]struct{}, len(*old))
+	newSet := make(map[api.UserInfo]struct{}, len(*new))
 	for _, v := range *old {
-		mSrc[v] = 0
-		mAll[v] = 0
+		oldSet[v] = struct{}{}
 	}
-	// 2.目数组中，存不进去，即重复元素，所有存不进去的集合就是并集
 	for _, v := range *new {
-		l := len(mAll)
-		mAll[v] = 1
-		if l != len(mAll) { // 长度变化，即可以存
-			l = len(mAll)
-		} else { // 存不了，进并集
-			set = append(set, v)
+		newSet[v] = struct{}{}
+	}
+	for v := range oldSet {
+		if _, exists := newSet[v]; !exists {
+			deleted = append(deleted, v)
 		}
 	}
-	// 3.遍历交集，在并集中找，找到就从并集中删，删完后就是补集（即并-交=所有变化的元素）
-	for _, v := range set {
-		delete(mAll, v)
-	}
-	// 4.此时，mall是补集，所有元素去源中找，找到就是删除的，找不到的必定能在目数组中找到，即新加的
-	for v := range mAll {
-		_, exist := mSrc[v]
-		if exist {
-			deleted = append(deleted, v)
-		} else {
+	for v := range newSet {
+		if _, exists := oldSet[v]; !exists {
 			added = append(added, v)
 		}
 	}
@@ -436,6 +432,8 @@ func (c *Controller) userInfoMonitor() (err error) {
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
 	}
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
 
 	// Get server status
 	CPU, Mem, Disk, Uptime, err := serverstatus.GetSystemInfo()

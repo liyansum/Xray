@@ -32,9 +32,9 @@ func (c *Controller) buildTrojanUser(userInfo *[]api.UserInfo) (users []*protoco
 }
 
 func (c *Controller) buildSSUser(userInfo *[]api.UserInfo, method string) (users []*protocol.User) {
-	users = make([]*protocol.User, len(*userInfo))
+	users = make([]*protocol.User, 0, len(*userInfo))
 
-	for i, user := range *userInfo {
+	for _, user := range *userInfo {
 		// shadowsocks2022 Key = "openssl rand -base64 32" and multi users needn't cipher method
 		if C.Contains(shadowaead_2022.List, strings.ToLower(method)) {
 			e := c.buildUserTag(&user)
@@ -43,22 +43,22 @@ func (c *Controller) buildSSUser(userInfo *[]api.UserInfo, method string) (users
 				log.Error(fmt.Errorf("[UID: %d] %s", user.UID, err))
 				continue
 			}
-			users[i] = &protocol.User{
+			users = append(users, &protocol.User{
 				Level: 0,
 				Email: e,
 				Account: serial.ToTypedMessage(&shadowsocks_2022.Account{
 					Key: userKey,
 				}),
-			}
+			})
 		} else {
-			users[i] = &protocol.User{
+			users = append(users, &protocol.User{
 				Level: 0,
 				Email: c.buildUserTag(&user),
 				Account: serial.ToTypedMessage(&shadowsocks.Account{
 					Password:   user.Passwd,
 					CipherType: cipherFromString(method),
 				}),
-			}
+			})
 		}
 	}
 	return users

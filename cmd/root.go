@@ -76,7 +76,7 @@ func run() error {
 		return fmt.Errorf("Parse config file %v failed: %s \n", cfgFile, err)
 	}
 
-	if panelConfig.LogConfig.Level == "debug" {
+	if panelConfig.LogConfig != nil && panelConfig.LogConfig.Level == "debug" {
 		log.SetReportCaller(true)
 	}
 
@@ -94,7 +94,7 @@ func run() error {
 				log.Panicf("Parse config file %v failed: %s \n", cfgFile, err)
 			}
 
-			if panelConfig.LogConfig.Level == "debug" {
+			if panelConfig.LogConfig != nil && panelConfig.LogConfig.Level == "debug" {
 				log.SetReportCaller(true)
 			}
 

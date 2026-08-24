@@ -4,18 +4,23 @@ package rule
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 
-	mapset "github.com/deckarep/golang-set"
 	"github.com/liyansum/Xray/api"
 	log "github.com/sirupsen/logrus"
 )
 
 type Manager struct {
 	InboundRule         *sync.Map // Key: Tag, Value: []api.DetectRule
-	InboundDetectResult *sync.Map // key: Tag, Value: mapset.NewSet []api.DetectResult
+	InboundDetectResult *sync.Map // key: Tag, value: *detectResultState
+}
+
+type detectResultState struct {
+	mu      sync.Mutex
+	results map[api.DetectResult]struct{}
 }
 
 func New() *Manager {
@@ -26,6 +31,7 @@ func New() *Manager {
 }
 
 func (r *Manager) UpdateRule(tag string, newRuleList []api.DetectRule) error {
+	newRuleList = slices.Clone(newRuleList)
 	if value, ok := r.InboundRule.LoadOrStore(tag, newRuleList); ok {
 		oldRuleList := value.([]api.DetectRule)
 		if !reflect.DeepEqual(oldRuleList, newRuleList) {
@@ -35,14 +41,22 @@ func (r *Manager) UpdateRule(tag string, newRuleList []api.DetectRule) error {
 	return nil
 }
 
+func (r *Manager) RemoveRule(tag string) {
+	r.InboundRule.Delete(tag)
+	r.InboundDetectResult.Delete(tag)
+}
+
 func (r *Manager) GetDetectResult(tag string) (*[]api.DetectResult, error) {
 	detectResult := make([]api.DetectResult, 0)
-	if value, ok := r.InboundDetectResult.LoadAndDelete(tag); ok {
-		resultSet := value.(mapset.Set)
-		it := resultSet.Iterator()
-		for result := range it.C {
-			detectResult = append(detectResult, result.(api.DetectResult))
+	if value, ok := r.InboundDetectResult.Load(tag); ok {
+		state := value.(*detectResultState)
+		state.mu.Lock()
+		detectResult = make([]api.DetectResult, 0, len(state.results))
+		for result := range state.results {
+			detectResult = append(detectResult, result)
 		}
+		clear(state.results)
+		state.mu.Unlock()
 	}
 	return &detectResult, nil
 }
@@ -68,15 +82,12 @@ func (r *Manager) Detect(tag string, destination string, email string) (reject b
 				log.Debug(fmt.Sprintf("Record illegal behavior failed! Cannot find user's uid: %s", email))
 				return reject
 			}
-			newSet := mapset.NewSetWith(api.DetectResult{UID: uid, RuleID: hitRuleID})
-			// If there are any hit history
-			if v, ok := r.InboundDetectResult.LoadOrStore(tag, newSet); ok {
-				resultSet := v.(mapset.Set)
-				// If this is a new record
-				if resultSet.Add(api.DetectResult{UID: uid, RuleID: hitRuleID}) {
-					r.InboundDetectResult.Store(tag, resultSet)
-				}
-			}
+			newState := &detectResultState{results: make(map[api.DetectResult]struct{})}
+			value, _ := r.InboundDetectResult.LoadOrStore(tag, newState)
+			state := value.(*detectResultState)
+			state.mu.Lock()
+			state.results[api.DetectResult{UID: uid, RuleID: hitRuleID}] = struct{}{}
+			state.mu.Unlock()
 		}
 	}
 	return reject

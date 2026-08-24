@@ -186,8 +186,13 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		if ok {
 			// Uplink and downlink intentionally share one bucket: the configured
 			// speed is the user's aggregate bandwidth limit.
-			inboundLink.Writer = d.Limiter.RateWriter(ctx, inboundLink.Writer, bucket)
-			outboundLink.Writer = d.Limiter.RateWriter(ctx, outboundLink.Writer, bucket)
+			if ob := session.OutboundsFromContext(ctx); len(ob) != 0 && ob[len(ob)-1].Target.Network == net.Network_UDP {
+				inboundLink.Writer = d.Limiter.RatePacketWriter(ctx, inboundLink.Writer, bucket)
+				outboundLink.Writer = d.Limiter.RatePacketWriter(ctx, outboundLink.Writer, bucket)
+			} else {
+				inboundLink.Writer = d.Limiter.RateWriter(ctx, inboundLink.Writer, bucket)
+				outboundLink.Writer = d.Limiter.RateWriter(ctx, outboundLink.Writer, bucket)
+			}
 		}
 
 		p := d.policy.ForLevel(user.Level)
@@ -234,8 +239,13 @@ func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) 
 		}
 		if limited {
 			// Both directions intentionally share the user's aggregate bucket.
-			link.Reader = d.Limiter.RateReader(ctx, link.Reader, bucket)
-			link.Writer = d.Limiter.RateWriter(ctx, link.Writer, bucket)
+			if ob := session.OutboundsFromContext(ctx); len(ob) != 0 && ob[len(ob)-1].Target.Network == net.Network_UDP {
+				link.Reader = d.Limiter.RatePacketReader(ctx, link.Reader, bucket)
+				link.Writer = d.Limiter.RatePacketWriter(ctx, link.Writer, bucket)
+			} else {
+				link.Reader = d.Limiter.RateReader(ctx, link.Reader, bucket)
+				link.Writer = d.Limiter.RateWriter(ctx, link.Writer, bucket)
+			}
 		}
 
 		link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}

@@ -10,9 +10,7 @@ import (
 
 // Validator stores valid trojan users.
 type Validator struct {
-	// Considering email's usage here, map + sync.Mutex/RWMutex may have better performance.
 	email sync.Map
-	users sync.Map
 }
 
 // Add a trojan user, Email must be empty or unique.
@@ -22,13 +20,6 @@ func (v *Validator) Add(u *protocol.MemoryUser) error {
 		if loaded {
 			return errors.New("User ", u.Email, " already exists.")
 		}
-	}
-	_, loaded := v.users.LoadOrStore(string(u.Account.(*MemoryAccount).Key), u)
-	if loaded {
-		if u.Email != "" {
-			v.email.Delete(strings.ToLower(u.Email))
-		}
-		return errors.New("User credential already exists.")
 	}
 	return nil
 }
@@ -44,20 +35,10 @@ func (v *Validator) Del(e string) error {
 		return errors.New("User ", e, " not found.")
 	}
 	v.email.Delete(le)
-	v.users.Delete(string(u.(*protocol.MemoryUser).Account.(*MemoryAccount).Key))
 	return nil
 }
 
-// Get a trojan user with hashed key, nil if user doesn't exist.
-func (v *Validator) Get(hash string) *protocol.MemoryUser {
-	u, _ := v.users.Load(hash)
-	if u != nil {
-		return u.(*protocol.MemoryUser)
-	}
-	return nil
-}
-
-// Get a trojan user with hashed key, nil if user doesn't exist.
+// GetByEmail returns a Trojan user by its case-insensitive email.
 func (v *Validator) GetByEmail(email string) *protocol.MemoryUser {
 	email = strings.ToLower(email)
 	u, _ := v.email.Load(email)

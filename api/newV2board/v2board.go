@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"slices"
 	"strconv"
@@ -98,28 +99,31 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 		SetHeader("If-None-Match", c.eTags["node"]).
 		ForceContentType("application/json").
 		Get(path)
+	if err != nil || res == nil {
+		_, parseErr := c.parseResponse(res, path, err)
+		return nil, parseErr
+	}
 
 	// Etag identifier for a specific version of a resource. StatusCode = 304 means no changed
 	if res.StatusCode() == 304 {
 		return nil, errors.New(api.NodeNotModified)
-	}
-	// update etag
-	if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTags["node"] {
-		c.eTags["node"] = res.Header().Get("Etag")
 	}
 
 	nodeInfoResp, err := c.parseResponse(res, path, err)
 	if err != nil {
 		return nil, err
 	}
-	b, _ := nodeInfoResp.Encode()
-	json.Unmarshal(b, server)
+	b, err := nodeInfoResp.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("encode node response: %w", err)
+	}
+	if err := json.Unmarshal(b, server); err != nil {
+		return nil, fmt.Errorf("unmarshal node response: %w", err)
+	}
 
 	if server.ServerPort == 0 {
 		return nil, errors.New("server port must > 0")
 	}
-
-	c.resp.Store(server)
 
 	switch c.NodeType {
 	case "Trojan":
@@ -132,6 +136,10 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 
 	if err != nil {
 		return nil, fmt.Errorf("parse node info failed: %s, \nError: %s", api.SanitizeResponse(res), api.RedactText(err.Error()))
+	}
+	c.resp.Store(server)
+	if etag := res.Header().Get("Etag"); etag != "" {
+		c.eTags["node"] = etag
 	}
 
 	return nodeInfo, nil
@@ -169,11 +177,6 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		_, parseErr := c.parseResponse(res, path, err)
 		return nil, parseErr
 	}
-	// update etag
-	if res.Header().Get("Etag") != "" && res.Header().Get("Etag") != c.eTags["users"] {
-		c.eTags["users"] = res.Header().Get("Etag")
-	}
-
 	usersResp, err := c.parseResponse(res, path, err)
 	if err != nil {
 		return nil, err
@@ -187,6 +190,9 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	}
 	if len(users) == 0 {
 		return nil, errors.New("users is null")
+	}
+	if etag := res.Header().Get("Etag"); etag != "" {
+		c.eTags["users"] = etag
 	}
 
 	var deviceLimit int
@@ -202,7 +208,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		if c.SpeedLimit > 0 {
 			u.SpeedLimit = uint64(c.SpeedLimit * 1000000 / 8)
 		} else {
-			u.SpeedLimit = uint64(user.SpeedLimit * 1000000 / 8)
+			u.SpeedLimit = uint64(max(user.SpeedLimit, 0)) * 1000000 / 8
 		}
 		//Prefer local config
 		if c.DeviceLimit > 0 {
@@ -243,7 +249,10 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		// counters when only the online-device snapshot changed.
 		return nil, errors.New(api.UserNotModified)
 	}
-	c.lastUserList = append(c.lastUserList[:0], userList...)
+	// Let a formerly large user snapshot be collected after the panel shrinks.
+	// Reusing its backing array would retain both the allocation and stale string
+	// references beyond the new slice length.
+	c.lastUserList = slices.Clone(userList)
 
 	return &userList, nil
 }
@@ -308,15 +317,23 @@ func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
 
 // GetNodeRule implements the API interface
 func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
-	routes := c.resp.Load().(*serverConfig).Routes
+	response := c.resp.Load()
+	if response == nil {
+		return nil, errors.New("node info is not loaded")
+	}
+	routes := response.(*serverConfig).Routes
 
 	ruleList := c.LocalRuleList
 
 	for i := range routes {
 		if routes[i].Action == "block" {
+			pattern, err := regexp.Compile(strings.Join(routes[i].Match, "|"))
+			if err != nil {
+				return nil, fmt.Errorf("compile block route %d: %w", i, err)
+			}
 			ruleList = append(ruleList, api.DetectRule{
 				ID:      i,
-				Pattern: regexp.MustCompile(strings.Join(routes[i].Match, "|")),
+				Pattern: pattern,
 			})
 		}
 	}
@@ -340,12 +357,12 @@ func (c *APIClient) ReportNodeOnlineUsers(onlineUserList *[]api.OnlineUser) erro
 	path := "/api/v1/server/UniProxy/alive"
 	res, err := c.client.R().SetBody(data).ForceContentType("application/json").Post(path)
 	_, err = c.parseResponse(res, path, err)
-	// 面板无对应接口时先不报错
-	if err != nil {
+	// Old panels do not implement this endpoint. Ignore only that compatibility
+	// case; network failures and server errors must remain visible and retryable.
+	if err != nil && res != nil && (res.StatusCode() == http.StatusNotFound || res.StatusCode() == http.StatusMethodNotAllowed) {
 		return nil
 	}
-
-	return nil
+	return err
 }
 
 // ReportIllegal implements the API interface

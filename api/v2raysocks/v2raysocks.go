@@ -245,9 +245,13 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	ruleListResponse := c.ConfigResp.Get("routing").Get("rules").GetIndex(1).Get("domain").MustStringArray()
 	for i, rule := range ruleListResponse {
 		rule = strings.TrimPrefix(rule, "regexp:")
+		pattern, err := regexp.Compile(rule)
+		if err != nil {
+			return nil, fmt.Errorf("compile rule %d: %w", i, err)
+		}
 		ruleListItem := api.DetectRule{
 			ID:      i,
-			Pattern: regexp.MustCompile(rule),
+			Pattern: pattern,
 		}
 		ruleList = append(ruleList, ruleListItem)
 	}

@@ -310,7 +310,8 @@ func TestVLESSRequestFlowModes(t *testing.T) {
 func TestVLESSUDPPacketCodecPreservesDatagrams(t *testing.T) {
 	var wire bytes.Buffer
 	writer := newVLESSMultiLengthPacketWriter(buf.NewWriter(&wire))
-	packets := [][]byte{{0xc3, 0, 0, 1, 'q'}, []byte("second-datagram")}
+	largePacket := bytes.Repeat([]byte{0x5a}, buf.Size+1024)
+	packets := [][]byte{{0xc3, 0, 0, 1, 'q'}, []byte("second-datagram"), largePacket}
 	mb := make(buf.MultiBuffer, 0, len(packets))
 	for _, packet := range packets {
 		mb = append(mb, buf.FromBytes(packet))
@@ -330,6 +331,9 @@ func TestVLESSUDPPacketCodecPreservesDatagrams(t *testing.T) {
 		buf.ReleaseMulti(packet)
 		if !bytes.Equal(data, expected) {
 			t.Fatalf("packet=%x expected=%x", data, expected)
+		}
+		if len(packet) != 1 {
+			t.Fatalf("one datagram was split into %d buffers", len(packet))
 		}
 	}
 }
@@ -540,6 +544,81 @@ func TestAnyTLSDoesNotCapActiveIncreasingStreams(t *testing.T) {
 	}
 }
 
+func TestAnyTLSSlowStreamDoesNotBlockSession(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	releaseSlow := make(chan struct{})
+	session := newAnyTLSServerSession(ctx, serverConn, serverConn, testActivity{}, func(stream *anyTLSStream) {
+		if stream.id == 1 {
+			<-releaseSlow
+			return
+		}
+		_ = stream.handshakeSuccess()
+	})
+	done := make(chan error, 1)
+	go func() { done <- session.run() }()
+
+	settings := []byte("v=2\nclient=xray-test\npadding-md5=" + anyTLSPaddingMD5)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSettings, 0, settings)
+	if command, _, _ := readTestAnyTLSFrame(t, clientConn); command != anyTLSCmdServerSetting {
+		t.Fatalf("unexpected server settings command: %d", command)
+	}
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, 1, nil)
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdPSH, 1, []byte("unread payload"))
+	writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, 3, nil)
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	command, streamID, _ := readTestAnyTLSFrame(t, clientConn)
+	if command != anyTLSCmdSYNACK || streamID != 3 {
+		t.Fatalf("slow stream blocked another stream: command=%d stream=%d", command, streamID)
+	}
+
+	_ = clientConn.Close()
+	close(releaseSlow)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("AnyTLS server session did not stop")
+	}
+}
+
+func TestAnyTLSReceiveQueueIsBoundedAndReleased(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(1, session)
+
+	var rejected bool
+	for range anyTLSStreamQueuedFrames + 1 {
+		payload := buf.NewWithSize(8192)
+		payload.Extend(8192)
+		if err := stream.deliver(payload); err != nil {
+			payload.Release()
+			if err != errAnyTLSReceiveWindowExceeded {
+				t.Fatalf("unexpected queue error: %v", err)
+			}
+			rejected = true
+			break
+		}
+	}
+	if !rejected {
+		t.Fatal("stream receive queue exceeded its memory budget")
+	}
+	if got := session.budget.queuedBytes.Load(); got > anyTLSStreamQueuedBytes {
+		t.Fatalf("queued %d bytes, limit %d", got, anyTLSStreamQueuedBytes)
+	}
+	stream.abortRemote()
+	if bytes := session.budget.queuedBytes.Load(); bytes != 0 {
+		t.Fatalf("queue cleanup retained %d bytes", bytes)
+	}
+	if frames := session.budget.queuedFrames.Load(); frames != 0 {
+		t.Fatalf("queue cleanup retained %d frames", frames)
+	}
+}
+
 func TestAnyTLSUoTPacket(t *testing.T) {
 	var packet bytes.Buffer
 	destination := net.UDPDestination(net.DomainAddress("dns.example"), 53)
@@ -580,4 +659,28 @@ func BenchmarkMultiProtocolDetection(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkAnyTLSStreamQueue(b *testing.B) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(1, session)
+	payload := bytes.Repeat([]byte{0x5a}, 1200)
+	readBuffer := make([]byte, len(payload))
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	for range b.N {
+		frame := buf.NewWithSize(int32(len(payload)))
+		_, _ = frame.Write(payload)
+		if err := stream.deliver(frame); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.ReadFull(stream, readBuffer); err != nil {
+			b.Fatal(err)
+		}
+	}
+	stream.abortRemote()
 }

@@ -288,9 +288,13 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	} else {
 		for _, r := range ruleListResponse.Rules {
 			if r.Type == "reg" {
+				pattern, err := regexp.Compile(r.Pattern)
+				if err != nil {
+					return nil, fmt.Errorf("compile rule %d: %w", r.ID, err)
+				}
 				ruleList = append(ruleList, api.DetectRule{
 					ID:      r.ID,
-					Pattern: regexp.MustCompile(r.Pattern),
+					Pattern: pattern,
 				})
 			}
 

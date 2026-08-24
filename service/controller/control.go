@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/xtls/xray-core/common/protocol"
@@ -32,7 +33,7 @@ func (c *Controller) addInbound(config *core.InboundHandlerConfig) error {
 	}
 	handler, ok := rawHandler.(inbound.Handler)
 	if !ok {
-		return fmt.Errorf("not an InboundHandler: %s", err)
+		return fmt.Errorf("created object %T is not an inbound handler", rawHandler)
 	}
 	if err := c.ibm.AddHandler(context.Background(), handler); err != nil {
 		return err
@@ -47,7 +48,7 @@ func (c *Controller) addOutbound(config *core.OutboundHandlerConfig) error {
 	}
 	handler, ok := rawHandler.(outbound.Handler)
 	if !ok {
-		return fmt.Errorf("not an InboundHandler: %s", err)
+		return fmt.Errorf("created object %T is not an outbound handler", rawHandler)
 	}
 	if err := c.obm.AddHandler(context.Background(), handler); err != nil {
 		return err
@@ -69,15 +70,23 @@ func (c *Controller) addUsers(users []*protocol.User, tag string) error {
 	if !ok {
 		return fmt.Errorf("handler %s has not implemented proxy.UserManager", tag)
 	}
+	added := make([]string, 0, len(users))
+	rollback := func(addErr error) error {
+		for i := len(added) - 1; i >= 0; i-- {
+			addErr = errors.Join(addErr, userManager.RemoveUser(context.Background(), added[i]))
+		}
+		return addErr
+	}
 	for _, item := range users {
 		mUser, err := item.ToMemoryUser()
 		if err != nil {
-			return err
+			return rollback(err)
 		}
 		err = userManager.AddUser(context.Background(), mUser)
 		if err != nil {
-			return err
+			return rollback(err)
 		}
+		added = append(added, mUser.Email)
 	}
 	return nil
 }
@@ -94,18 +103,18 @@ func (c *Controller) removeUsers(users []string, tag string) error {
 
 	userManager, ok := inboundInstance.GetInbound().(proxy.UserManager)
 	if !ok {
-		return fmt.Errorf("handler %s is not implement proxy.UserManager", err)
+		return fmt.Errorf("handler %s has not implemented proxy.UserManager", tag)
 	}
+	var removeErr error
 	for _, email := range users {
-		err = userManager.RemoveUser(context.Background(), email)
-		if err != nil {
-			return err
+		if err := userManager.RemoveUser(context.Background(), email); err != nil {
+			removeErr = errors.Join(removeErr, err)
 		}
 		if err := c.unregisterUserCounters(email); err != nil {
-			return err
+			removeErr = errors.Join(removeErr, err)
 		}
 	}
-	return nil
+	return removeErr
 }
 
 func (c *Controller) unregisterUserCounters(email string) error {
@@ -113,6 +122,9 @@ func (c *Controller) unregisterUserCounters(email string) error {
 		"user>>>" + email + ">>>traffic>>>uplink",
 		"user>>>" + email + ">>>traffic>>>downlink",
 	} {
+		if c.stm.GetCounter(name) == nil {
+			continue
+		}
 		if err := c.stm.UnregisterCounter(name); err != nil {
 			return err
 		}

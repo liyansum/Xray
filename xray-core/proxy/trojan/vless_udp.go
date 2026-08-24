@@ -41,19 +41,17 @@ func (r *vlessLengthPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if remaining == 0 {
 		return nil, errors.New("empty VLESS UDP packet")
 	}
-	mb := make(buf.MultiBuffer, 0, remaining/buf.Size+1)
-	for remaining > 0 {
-		size := min(remaining, buf.Size)
-		b := buf.New()
-		if _, err := b.ReadFullFrom(r.reader, size); err != nil {
-			b.Release()
-			buf.ReleaseMulti(mb)
-			return nil, errors.New("failed to read VLESS UDP packet payload").Base(err)
-		}
-		mb = append(mb, b)
-		remaining -= size
+	var packet *buf.Buffer
+	if remaining <= buf.Size {
+		packet = buf.New()
+	} else {
+		packet = buf.NewWithSize(remaining)
 	}
-	return mb, nil
+	if _, err := packet.ReadFullFrom(r.reader, remaining); err != nil {
+		packet.Release()
+		return nil, errors.New("failed to read VLESS UDP packet payload").Base(err)
+	}
+	return buf.MultiBuffer{packet}, nil
 }
 
 // vlessMultiLengthPacketWriter preserves packet boundaries and prefixes every
@@ -71,10 +69,15 @@ func (w *vlessMultiLengthPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) erro
 	framed := make(buf.MultiBuffer, 0, len(mb))
 	for _, packet := range mb {
 		length := packet.Len()
-		if length == 0 || length+2 > buf.Size {
+		if length == 0 || length > 65535 {
 			continue
 		}
-		frame := buf.New()
+		var frame *buf.Buffer
+		if length+2 <= buf.Size {
+			frame = buf.New()
+		} else {
+			frame = buf.NewWithSize(length + 2)
+		}
 		_ = frame.WriteByte(byte(length >> 8))
 		_ = frame.WriteByte(byte(length))
 		_, _ = frame.Write(packet.Bytes())

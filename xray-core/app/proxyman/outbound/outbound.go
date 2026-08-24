@@ -20,14 +20,13 @@ type Manager struct {
 	taggedHandler    map[string]outbound.Handler
 	untaggedHandlers []outbound.Handler
 	running          bool
-	tagsCache        *sync.Map
+	tagsCache        sync.Map
 }
 
 // New creates a new Manager.
 func New(ctx context.Context, config *proxyman.OutboundConfig) (*Manager, error) {
 	m := &Manager{
 		taggedHandler: make(map[string]outbound.Handler),
-		tagsCache:     &sync.Map{},
 	}
 	return m, nil
 }
@@ -104,8 +103,6 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 	m.access.Lock()
 	defer m.access.Unlock()
 
-	m.tagsCache = &sync.Map{}
-
 	if m.defaultHandler == nil {
 		m.defaultHandler = handler
 	}
@@ -119,6 +116,7 @@ func (m *Manager) AddHandler(ctx context.Context, handler outbound.Handler) erro
 	} else {
 		m.untaggedHandlers = append(m.untaggedHandlers, handler)
 	}
+	m.clearTagsCache()
 
 	if m.running {
 		return handler.Start()
@@ -135,9 +133,15 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 	m.access.Lock()
 	defer m.access.Unlock()
 
-	m.tagsCache = &sync.Map{}
-
+	handler, found := m.taggedHandler[tag]
+	if !found {
+		return common.ErrNoClue
+	}
+	if err := handler.Close(); err != nil {
+		errors.LogWarningInner(ctx, err, "failed to close handler ", tag)
+	}
 	delete(m.taggedHandler, tag)
+	m.clearTagsCache()
 	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
 		m.defaultHandler = nil
 	}
@@ -162,13 +166,13 @@ func (m *Manager) ListHandlers(ctx context.Context) []outbound.Handler {
 
 // Select implements outbound.HandlerSelector.
 func (m *Manager) Select(selectors []string) []string {
+	m.access.RLock()
+	defer m.access.RUnlock()
+
 	key := strings.Join(selectors, ",")
 	if cache, ok := m.tagsCache.Load(key); ok {
 		return cache.([]string)
 	}
-
-	m.access.RLock()
-	defer m.access.RUnlock()
 
 	tags := make([]string, 0, len(selectors))
 
@@ -185,6 +189,16 @@ func (m *Manager) Select(selectors []string) []string {
 	m.tagsCache.Store(key, tags)
 
 	return tags
+}
+
+// clearTagsCache must be called while access is write-locked. Select holds the
+// corresponding read lock across both cache lookup and population, preventing a
+// stale result from being stored after a handler update.
+func (m *Manager) clearTagsCache() {
+	m.tagsCache.Range(func(key, _ interface{}) bool {
+		m.tagsCache.Delete(key)
+		return true
+	})
 }
 
 func init() {

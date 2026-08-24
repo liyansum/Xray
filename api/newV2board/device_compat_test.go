@@ -127,3 +127,37 @@ func TestAliveEndpointFailurePreservesLastSnapshot(t *testing.T) {
 		t.Fatalf("temporary failure cleared last alive snapshot: %d", got)
 	}
 }
+
+func TestInvalidPanelRuleReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	client := newDeviceTestClient(server)
+	client.resp.Store(&serverConfig{Routes: []route{{Action: "block", Match: []string{"[invalid"}}}})
+	if _, err := client.GetNodeRule(); err == nil {
+		t.Fatal("invalid panel regular expression caused no error")
+	}
+}
+
+func TestOnlineReportCompatibilityAndFailures(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		wantError  bool
+	}{
+		{name: "legacy missing endpoint", statusCode: http.StatusNotFound},
+		{name: "panel server failure", statusCode: http.StatusServiceUnavailable, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				http.Error(writer, http.StatusText(test.statusCode), test.statusCode)
+			}))
+			defer server.Close()
+			client := newDeviceTestClient(server)
+			online := []api.OnlineUser{{UID: 1, IP: "192.0.2.1"}}
+			err := client.ReportNodeOnlineUsers(&online)
+			if (err != nil) != test.wantError {
+				t.Fatalf("error=%v, wantError=%v", err, test.wantError)
+			}
+		})
+	}
+}

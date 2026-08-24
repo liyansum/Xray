@@ -22,12 +22,14 @@ func TestBlackholeHTTPResponse(t *testing.T) {
 
 	reader, writer := pipe.New(pipe.WithoutSizeLimit())
 
-	var mb buf.MultiBuffer
-	var rerr error
+	type readResult struct {
+		mb  buf.MultiBuffer
+		err error
+	}
+	result := make(chan readResult, 1)
 	go func() {
-		b, e := reader.ReadMultiBuffer()
-		mb = b
-		rerr = e
+		mb, err := reader.ReadMultiBuffer()
+		result <- readResult{mb: mb, err: err}
 	}()
 
 	link := transport.Link{
@@ -35,8 +37,9 @@ func TestBlackholeHTTPResponse(t *testing.T) {
 		Writer: writer,
 	}
 	common.Must(handler.Process(ctx, &link, nil))
-	common.Must(rerr)
-	if mb.IsEmpty() {
+	read := <-result
+	common.Must(read.err)
+	if read.mb.IsEmpty() {
 		t.Error("expect http response, but nothing")
 	}
 }

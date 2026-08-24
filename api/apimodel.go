@@ -2,10 +2,31 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 
 	"github.com/xtls/xray-core/infra/conf"
 )
+
+const maxPort = 65535
+
+// PortFromInt64 validates panel-provided ports before narrowing them to the
+// representation used by NodeInfo. A wrapped negative or oversized value can
+// otherwise select an unintended listener port.
+func PortFromInt64(port int64) (uint32, error) {
+	if port < 1 || port > maxPort {
+		return 0, fmt.Errorf("port %d is outside 1..%d", port, maxPort)
+	}
+	return uint32(port), nil
+}
+
+// PortFromUint64 is the unsigned counterpart used by JSON APIs.
+func PortFromUint64(port uint64) (uint32, error) {
+	if port < 1 || port > maxPort {
+		return 0, fmt.Errorf("port %d is outside 1..%d", port, maxPort)
+	}
+	return uint32(port), nil
+}
 
 const (
 	UserNotModified = "users not modified"

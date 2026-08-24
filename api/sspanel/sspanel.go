@@ -417,7 +417,10 @@ func (c *APIClient) ParseTrojanNodeResponse(nodeInfoResponse *NodeInfoResponse) 
 	if err != nil {
 		return nil, err
 	}
-	port := uint32(parsedPort)
+	port, err := api.PortFromInt64(parsedPort)
+	if err != nil {
+		return nil, err
+	}
 
 	if c.SpeedLimit > 0 {
 		speedLimit = uint64((c.SpeedLimit * 1000000) / 8)
@@ -526,7 +529,10 @@ func (c *APIClient) ParseSSPanelNodeInfo(nodeInfoResponse *NodeInfoResponse) (*a
 		return nil, err
 	}
 
-	port := uint32(parsedPort)
+	port, err := api.PortFromInt64(parsedPort)
+	if err != nil {
+		return nil, err
+	}
 
 	switch c.NodeType {
 	case "Shadowsocks":

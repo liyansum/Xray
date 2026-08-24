@@ -317,7 +317,10 @@ func (c *APIClient) ParseTrojanNodeResponse(nodeInfoResponse *simplejson.Json) (
 	marshalByte, _ := json.Marshal(tmpInboundInfo[0].(map[string]interface{}))
 	inboundInfo, _ := simplejson.NewJson(marshalByte)
 
-	port := uint32(inboundInfo.Get("port").MustUint64())
+	port, err := api.PortFromUint64(inboundInfo.Get("port").MustUint64())
+	if err != nil {
+		return nil, fmt.Errorf("invalid Trojan inbound port: %w", err)
+	}
 	host := inboundInfo.Get("streamSettings").Get("tlsSettings").Get("serverName").MustString()
 
 	// Create GeneralNodeInfo
@@ -339,7 +342,10 @@ func (c *APIClient) ParseSSNodeResponse(nodeInfoResponse *simplejson.Json) (*api
 	marshalByte, _ := json.Marshal(tmpInboundInfo[0].(map[string]interface{}))
 	inboundInfo, _ := simplejson.NewJson(marshalByte)
 
-	port := uint32(inboundInfo.Get("port").MustUint64())
+	port, err := api.PortFromUint64(inboundInfo.Get("port").MustUint64())
+	if err != nil {
+		return nil, fmt.Errorf("invalid Shadowsocks inbound port: %w", err)
+	}
 	method = inboundInfo.Get("settings").Get("method").MustString()
 	// Shadowsocks 2022
 	if C.Contains(shadowaead_2022.List, method) {

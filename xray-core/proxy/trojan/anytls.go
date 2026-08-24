@@ -57,11 +57,7 @@ var (
 		sum := md5.Sum(anyTLSPaddingScheme)
 		return hex.EncodeToString(sum[:])
 	}()
-	// Xray's general bytespool jumps from 32 KiB to 128 KiB. AnyTLS wire
-	// payloads are uint16-sized, so use the same 64 KiB receive class as the
-	// official AnyTLS/sing allocator instead of wasting half of a 128 KiB slab.
-	anyTLSLargeFramePool = sync.Pool{New: func() any { return new([anyTLSLargeFrameSize]byte) }}
-	anyTLSAddressParser  = protocol.NewAddressParser(
+	anyTLSAddressParser = protocol.NewAddressParser(
 		protocol.AddressFamilyByte(0x01, net.AddressFamilyIPv4),
 		protocol.AddressFamilyByte(0x04, net.AddressFamilyIPv6),
 		protocol.AddressFamilyByte(0x03, net.AddressFamilyDomain),
@@ -142,23 +138,14 @@ func newAnyTLSServerSession(_ context.Context, conn stat.Connection, reader io.R
 	}
 }
 
-func readAnyTLSFramePayload(reader io.Reader, length int) (*buf.Buffer, *[anyTLSLargeFrameSize]byte, error) {
-	if length > anyTLSFrameBufferSize {
-		storage := anyTLSLargeFramePool.Get().(*[anyTLSLargeFrameSize]byte)
-		payload := storage[:length]
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			anyTLSLargeFramePool.Put(storage)
-			return nil, nil, err
-		}
-		return buf.FromBytes(payload), storage, nil
-	}
-
-	payload := buf.NewWithSize(int32(length))
-	if _, err := payload.ReadFullFrom(reader, int32(length)); err != nil {
-		payload.Release()
+func readAnyTLSFramePayload(reader io.Reader, length int) ([]byte, []byte, error) {
+	storage := getAnyTLSBufferStorage(length)
+	payload := storage[:length]
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		putAnyTLSBufferStorage(storage)
 		return nil, nil, err
 	}
-	return payload, nil, nil
+	return payload, storage, nil
 }
 
 func (s *anyTLSServerSession) run() error {
@@ -178,16 +165,16 @@ func (s *anyTLSServerSession) run() error {
 		command := header[0]
 		streamID := binary.BigEndian.Uint32(header[1:5])
 		length := int(binary.BigEndian.Uint16(header[5:7]))
-		var frameData *buf.Buffer
-		var largeFrameData *[anyTLSLargeFrameSize]byte
+		var frameData []byte
+		var frameStorage []byte
 		var data []byte
 		if length != 0 {
 			var err error
-			frameData, largeFrameData, err = readAnyTLSFramePayload(s.reader, length)
+			frameData, frameStorage, err = readAnyTLSFramePayload(s.reader, length)
 			if err != nil {
 				return errors.New("failed to read AnyTLS frame payload").Base(err)
 			}
-			data = frameData.Bytes()
+			data = frameData
 		}
 
 		frameErr := func() error {
@@ -210,7 +197,7 @@ func (s *anyTLSServerSession) run() error {
 				s.openStream(streamID)
 			case anyTLSCmdPSH:
 				stream := s.getStream(streamID)
-				if stream != nil && frameData != nil {
+				if stream != nil && len(frameData) != 0 {
 					if err := stream.deliver(frameData); err != nil {
 						_ = stream.Close()
 					}
@@ -233,10 +220,7 @@ func (s *anyTLSServerSession) run() error {
 			return nil
 		}()
 		if frameData != nil {
-			frameData.Release()
-		}
-		if largeFrameData != nil {
-			anyTLSLargeFramePool.Put(largeFrameData)
+			putAnyTLSBufferStorage(frameStorage)
 		}
 		if frameErr != nil {
 			return frameErr
@@ -309,13 +293,13 @@ func (s *anyTLSServerSession) removeStream(id uint32) *anyTLSStream {
 	return stream
 }
 
-func (s *anyTLSServerSession) writePreparedFrameLocked(frame *buf.Buffer) error {
+func (s *anyTLSServerSession) writePreparedFrameLocked(frame []byte) error {
 	select {
 	case <-s.closed:
 		return io.ErrClosedPipe
 	default:
 	}
-	if err := buf.WriteAllBytes(s.conn, frame.Bytes(), nil); err != nil {
+	if err := buf.WriteAllBytes(s.conn, frame, nil); err != nil {
 		return errors.New("failed to write AnyTLS frame").Base(err)
 	}
 	s.activity.Update()
@@ -326,15 +310,14 @@ func (s *anyTLSServerSession) writeFrameLocked(command byte, streamID uint32, da
 	if len(data) > 65535 {
 		return errors.New("AnyTLS frame payload is too large")
 	}
-	frame := buf.NewWithSize(int32(anyTLSFrameHeaderSize + len(data)))
-	defer frame.Release()
-	header := frame.Extend(anyTLSFrameHeaderSize)
-	header[0] = command
-	binary.BigEndian.PutUint32(header[1:5], streamID)
-	binary.BigEndian.PutUint16(header[5:7], uint16(len(data)))
-	if _, err := frame.Write(data); err != nil {
-		return err
-	}
+	frameSize := anyTLSFrameHeaderSize + len(data)
+	storage := getAnyTLSBufferStorage(frameSize)
+	defer putAnyTLSBufferStorage(storage)
+	frame := storage[:frameSize]
+	frame[0] = command
+	binary.BigEndian.PutUint32(frame[1:5], streamID)
+	binary.BigEndian.PutUint16(frame[5:7], uint16(len(data)))
+	copy(frame[anyTLSFrameHeaderSize:], data)
 	return s.writePreparedFrameLocked(frame)
 }
 
@@ -402,28 +385,25 @@ func (s *anyTLSServerSession) writeMultiBufferFrames(stream *anyTLSStream, paylo
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	requestedSize := min(anyTLSFrameBufferSize, int(payload.Len())+anyTLSFrameHeaderSize)
-	frame := buf.NewWithSize(int32(requestedSize))
-	defer frame.Release()
+	storage := getAnyTLSBufferStorage(requestedSize)
+	defer putAnyTLSBufferStorage(storage)
+	frame := storage[:requestedSize]
 	for !payload.IsEmpty() {
 		// WriteMultiBufferCoalesced used to call stream.Write once per batch,
 		// so preserve its per-frame deadline and stream-close checks.
 		if err := stream.checkWritable(); err != nil {
 			return err
 		}
-		frame.Clear()
-		writable := frame.WritableBytes()
-		payloadCapacity := min(len(writable)-anyTLSFrameHeaderSize, anyTLSFramePayloadSize)
+		payloadCapacity := min(len(frame)-anyTLSFrameHeaderSize, anyTLSFramePayloadSize)
 		var copied int
-		payload, copied = buf.SplitBytes(payload, writable[anyTLSFrameHeaderSize:anyTLSFrameHeaderSize+payloadCapacity])
+		payload, copied = buf.SplitBytes(payload, frame[anyTLSFrameHeaderSize:anyTLSFrameHeaderSize+payloadCapacity])
 		if copied == 0 {
 			return io.ErrNoProgress
 		}
-		header := writable[:anyTLSFrameHeaderSize]
-		header[0] = anyTLSCmdPSH
-		binary.BigEndian.PutUint32(header[1:5], stream.id)
-		binary.BigEndian.PutUint16(header[5:7], uint16(copied))
-		frame.Commit(int32(anyTLSFrameHeaderSize + copied))
-		if err := s.writePreparedFrameLocked(frame); err != nil {
+		frame[0] = anyTLSCmdPSH
+		binary.BigEndian.PutUint32(frame[1:5], stream.id)
+		binary.BigEndian.PutUint16(frame[5:7], uint16(copied))
+		if err := s.writePreparedFrameLocked(frame[:anyTLSFrameHeaderSize+copied]); err != nil {
 			return err
 		}
 	}
@@ -450,8 +430,8 @@ type anyTLSStream struct {
 	once    sync.Once
 	report  sync.Once
 
-	pipeReader stdnet.Conn
-	pipeWriter stdnet.Conn
+	pipeReader *anyTLSSyncPipeReader
+	pipeWriter *anyTLSSyncPipeWriter
 
 	errMu  sync.RWMutex
 	dieErr error
@@ -460,7 +440,7 @@ type anyTLSStream struct {
 }
 
 func newAnyTLSStream(id uint32, session *anyTLSServerSession) *anyTLSStream {
-	pipeReader, pipeWriter := stdnet.Pipe()
+	pipeReader, pipeWriter := newAnyTLSSyncPipe()
 	stream := &anyTLSStream{
 		id: id, session: session,
 		pipeReader: pipeReader, pipeWriter: pipeWriter,
@@ -526,12 +506,12 @@ func (s *anyTLSStream) WriteMultiBuffer(payload buf.MultiBuffer) error {
 // deliver follows the official AnyTLS/sing-box stream model: each stream has
 // one synchronous pipe and a PSH is fully consumed before the session reads
 // another frame. The pipe has no internal queue or project-specific budget.
-func (s *anyTLSStream) deliver(payload *buf.Buffer) error {
-	written, err := s.pipeWriter.Write(payload.Bytes())
+func (s *anyTLSStream) deliver(payload []byte) error {
+	written, err := s.pipeWriter.Write(payload)
 	if err != nil {
 		return err
 	}
-	if written != int(payload.Len()) {
+	if written != len(payload) {
 		return io.ErrShortWrite
 	}
 	return nil

@@ -866,8 +866,7 @@ func TestAnyTLSSynchronousPipeHasNoReceiveQueue(t *testing.T) {
 	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
 	stream := newAnyTLSStream(1, session)
 
-	payload := buf.FromBytes(bytes.Repeat([]byte{0x5a}, 8192))
-	defer payload.Release()
+	payload := bytes.Repeat([]byte{0x5a}, 8192)
 	delivered := make(chan error, 1)
 	go func() { delivered <- stream.deliver(payload) }()
 	select {
@@ -877,7 +876,7 @@ func TestAnyTLSSynchronousPipeHasNoReceiveQueue(t *testing.T) {
 	case <-time.After(25 * time.Millisecond):
 	}
 
-	readBuffer := make([]byte, payload.Len())
+	readBuffer := make([]byte, len(payload))
 	if _, err := io.ReadFull(stream, readBuffer); err != nil {
 		stream.abortRemote()
 		t.Fatal(err)
@@ -903,9 +902,8 @@ func TestAnyTLSReadMultiBufferUses32KiBBatches(t *testing.T) {
 	stream := newAnyTLSStream(1, session)
 
 	expected := bytes.Repeat([]byte{0x5a}, 65535)
-	payload := buf.FromBytes(expected)
 	delivered := make(chan error, 1)
-	go func() { delivered <- stream.deliver(payload) }()
+	go func() { delivered <- stream.deliver(expected) }()
 
 	first, err := stream.ReadMultiBuffer()
 	if err != nil {
@@ -954,9 +952,8 @@ func TestAnyTLSReadMultiBufferPreservesHeaderRemainder(t *testing.T) {
 	stream := newAnyTLSStream(1, session)
 
 	expected := bytes.Repeat([]byte{0x6b}, anyTLSReadBatchSize+17)
-	payload := buf.FromBytes(expected)
 	delivered := make(chan error, 1)
-	go func() { delivered <- stream.deliver(payload) }()
+	go func() { delivered <- stream.deliver(expected) }()
 
 	header := make([]byte, 7)
 	if _, err := io.ReadFull(stream, header); err != nil {
@@ -987,43 +984,44 @@ func TestAnyTLSReadMultiBufferPreservesHeaderRemainder(t *testing.T) {
 }
 
 func TestAnyTLSUplinkFramePoolClasses(t *testing.T) {
-	regularExpected := bytes.Repeat([]byte{0x39}, anyTLSFrameBufferSize)
-	regular, regularStorage, err := readAnyTLSFramePayload(bytes.NewReader(regularExpected), len(regularExpected))
-	if err != nil {
-		t.Fatal(err)
+	for _, test := range []struct {
+		length   int
+		capacity int
+	}{
+		{1, 64},
+		{64, 64},
+		{65, 128},
+		{8192, 8192},
+		{8193, 16384},
+		{anyTLSFrameBufferSize, anyTLSFrameBufferSize},
+		{anyTLSFrameBufferSize + 1, anyTLSLargeFrameSize},
+		{65535, anyTLSLargeFrameSize},
+	} {
+		expected := bytes.Repeat([]byte{byte(test.length)}, test.length)
+		payload, storage, err := readAnyTLSFramePayload(bytes.NewReader(expected), len(expected))
+		if err != nil {
+			t.Fatalf("length %d: %v", test.length, err)
+		}
+		if capacity := cap(payload); capacity != test.capacity {
+			putAnyTLSBufferStorage(storage)
+			t.Fatalf("length %d has capacity %d, want %d", test.length, capacity, test.capacity)
+		}
+		if !bytes.Equal(payload, expected) {
+			putAnyTLSBufferStorage(storage)
+			t.Fatalf("length %d changed payload contents", test.length)
+		}
+		putAnyTLSBufferStorage(storage)
 	}
-	if regularStorage != nil {
-		regular.Release()
-		anyTLSLargeFramePool.Put(regularStorage)
-		t.Fatal("32 KiB AnyTLS uplink frame unexpectedly used the large-frame pool")
-	}
-	if capacity := cap(regular.Bytes()); capacity != anyTLSFrameBufferSize {
-		regular.Release()
-		t.Fatalf("regular AnyTLS uplink frame has capacity %d, want %d", capacity, anyTLSFrameBufferSize)
-	}
-	regular.Release()
+}
 
-	expected := bytes.Repeat([]byte{0x6a}, 65535)
-	payload, storage, err := readAnyTLSFramePayload(bytes.NewReader(expected), len(expected))
-	if err != nil {
-		t.Fatal(err)
+func TestAnyTLSFrameBufferAbovePoolLimit(t *testing.T) {
+	const size = anyTLSLargeFrameSize + anyTLSFrameHeaderSize
+	storage := getAnyTLSBufferStorage(size)
+	if capacity := cap(storage); capacity != size {
+		putAnyTLSBufferStorage(storage)
+		t.Fatalf("oversized control frame has capacity %d, want %d", capacity, size)
 	}
-	if storage == nil {
-		payload.Release()
-		t.Fatal("large AnyTLS uplink frame did not use the dedicated pool")
-	}
-	if capacity := cap(payload.Bytes()); capacity != anyTLSLargeFrameSize {
-		payload.Release()
-		anyTLSLargeFramePool.Put(storage)
-		t.Fatalf("large AnyTLS uplink frame has capacity %d, want %d", capacity, anyTLSLargeFrameSize)
-	}
-	if !bytes.Equal(payload.Bytes(), expected) {
-		payload.Release()
-		anyTLSLargeFramePool.Put(storage)
-		t.Fatal("large AnyTLS uplink frame changed payload contents")
-	}
-	payload.Release()
-	anyTLSLargeFramePool.Put(storage)
+	putAnyTLSBufferStorage(storage)
 }
 
 func TestAnyTLSConcurrentUplinkThroughput(t *testing.T) {
@@ -1212,12 +1210,12 @@ func TestAnyTLSConcurrentDownlinkThroughput(t *testing.T) {
 }
 
 func TestAnyTLSWriteMultiBufferPacksPoolAlignedFrames(t *testing.T) {
-	frame := buf.NewWithSize(anyTLSFrameHeaderSize + anyTLSFramePayloadSize)
-	if capacity := len(frame.WritableBytes()); capacity != anyTLSFrameBufferSize {
-		frame.Release()
+	storage := getAnyTLSBufferStorage(anyTLSFrameHeaderSize + anyTLSFramePayloadSize)
+	if capacity := cap(storage); capacity != anyTLSFrameBufferSize {
+		putAnyTLSBufferStorage(storage)
 		t.Fatalf("pool-aligned AnyTLS frame has capacity %d, want %d", capacity, anyTLSFrameBufferSize)
 	}
-	frame.Release()
+	putAnyTLSBufferStorage(storage)
 
 	serverConn, clientConn := stdnet.Pipe()
 	defer clientConn.Close()
@@ -1387,9 +1385,7 @@ func BenchmarkAnyTLSSynchronousStreamPipe(b *testing.B) {
 	delivered := make(chan error)
 	go func() {
 		for range b.N {
-			frame := buf.FromBytes(payload)
-			err := stream.deliver(frame)
-			frame.Release()
+			err := stream.deliver(payload)
 			delivered <- err
 		}
 	}()

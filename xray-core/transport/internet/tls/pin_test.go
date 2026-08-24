@@ -151,3 +151,33 @@ func TestVerifyPeerCACert(t *testing.T) {
 		t.Fatal("expected to fail verifying leaf cert with incorrect pinned CA hash, but got no error")
 	}
 }
+
+func TestVerifyConnectionChecksPinsOnResumption(t *testing.T) {
+	leafCert, leafHash := cert.MustGenerate(nil, cert.DNSNames("example.com"))
+	leaf := common.Must2(x509.ParseCertificate(leafCert.Certificate))
+	leafHash[0]++
+
+	config := (&Config{
+		EnableSessionResumption: true,
+		PinnedPeerCertSha256:    [][]byte{leafHash[:]},
+	}).GetTLSConfig()
+	if config.VerifyPeerCertificate != nil {
+		t.Fatal("custom certificate policy must not use the resumption-skipped VerifyPeerCertificate callback")
+	}
+	if config.VerifyConnection == nil {
+		t.Fatal("custom certificate policy has no VerifyConnection callback")
+	}
+	if err := config.VerifyConnection(tls.ConnectionState{
+		DidResume:        true,
+		PeerCertificates: []*x509.Certificate{leaf},
+	}); err == nil {
+		t.Fatal("resumed connection accepted a certificate that does not match its pin")
+	}
+}
+
+func TestVerifyConnectionAllowsServerWithoutClientCertificate(t *testing.T) {
+	config := (&Config{}).GetTLSConfig()
+	if err := config.VerifyConnection(tls.ConnectionState{}); err != nil {
+		t.Fatalf("ordinary server connection without a client certificate was rejected: %v", err)
+	}
+}

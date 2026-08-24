@@ -280,6 +280,10 @@ func (c *APIClient) ParseUserListResponse(userInfoResponse *[]User) (*[]api.User
 
 func (c *APIClient) ParseNodeInfo(nodeInfoResponse *Server) (*api.NodeInfo, error) {
 	nodeConfig := nodeInfoResponse
+	port, err := api.PortFromInt64(int64(nodeConfig.Port))
+	if err != nil {
+		return nil, err
+	}
 	var enableTLS bool
 	switch c.NodeType {
 	case "Shadowsocks":
@@ -292,7 +296,7 @@ func (c *APIClient) ParseNodeInfo(nodeInfoResponse *Server) (*api.NodeInfo, erro
 	return &api.NodeInfo{
 		NodeType:          c.NodeType,
 		NodeID:            c.NodeID,
-		Port:              uint32(nodeConfig.Port),
+		Port:              port,
 		TransportProtocol: "tcp",
 		EnableTLS:         enableTLS,
 		CypherMethod:      nodeConfig.Method,

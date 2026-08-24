@@ -361,6 +361,12 @@ func (c *Config) parseServerName() string {
 }
 
 func (r *RandCarrier) verifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) (err error) {
+	// With no custom policy, leave verification entirely to crypto/tls. This
+	// also permits the server side of an ordinary TLS connection, where the
+	// client usually does not present a certificate.
+	if r.PinnedPeerCertSha256 == nil && r.VerifyPeerCertByName == nil {
+		return nil
+	}
 	// extract x509 certificates from rawCerts (verifiedChains will be nil if InsecureSkipVerify is true)
 	certs := make([]*x509.Certificate, len(rawCerts))
 	for i, asn1Data := range rawCerts {
@@ -429,7 +435,18 @@ func (r *RandCarrier) verifyPeerCert(rawCerts [][]byte, verifiedChains [][]*x509
 		return errors.New("peer cert is invalid (against pinned CA and serverName)")
 	}
 
-	return nil // r.PinnedPeerCertSha256==nil && r.verifyPeerCertByName==nil
+	return nil
+}
+
+// verifyConnection runs for full and resumed handshakes. In contrast,
+// VerifyPeerCertificate is skipped when a client resumes a session, which can
+// bypass certificate pinning or VerifyPeerCertByName after policy changes.
+func (r *RandCarrier) verifyConnection(state tls.ConnectionState) error {
+	rawCerts := make([][]byte, len(state.PeerCertificates))
+	for index, certificate := range state.PeerCertificates {
+		rawCerts[index] = certificate.Raw
+	}
+	return r.verifyPeerCert(rawCerts, state.VerifiedChains)
 }
 
 type RandCarrier struct {
@@ -469,7 +486,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 		RootCAs:                root,
 		NextProtos:             slices.Clone(c.NextProtocol),
 		SessionTicketsDisabled: !c.EnableSessionResumption,
-		VerifyPeerCertificate:  randCarrier.verifyPeerCert,
+		VerifyConnection:       randCarrier.verifyConnection,
 	}
 	randCarrier.Config = config
 	if len(c.VerifyPeerCertByName) > 0 {
@@ -543,17 +560,22 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 			}
 		}
 	} else if len(c.Certificate) > 0 {
-		// Keep the existing ECDSA AEAD suites while excluding Go's two
-		// ECDHE-ECDSA CBC defaults. TLS 1.3 cipher suites are unaffected.
+		// Keep forward-secret AEAD suites for both certificate families while
+		// excluding CBC and static-RSA key exchange. Restricting this list to
+		// ECDSA accidentally makes RSA certificates unusable with TLS 1.2.
+		// TLS 1.3 cipher suites are unaffected by this field.
 		config.CipherSuites = []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 		}
 	}
 
 	if len(c.MasterKeyLog) > 0 && c.MasterKeyLog != "none" {
-		writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+		writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 		if err != nil {
 			errors.LogErrorInner(context.Background(), err, "failed to open ", c.MasterKeyLog, " as master key log")
 		} else {

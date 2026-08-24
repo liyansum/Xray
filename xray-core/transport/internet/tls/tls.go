@@ -161,6 +161,24 @@ func copyConfig(c *tls.Config) *utls.Config {
 		EncryptedClientHelloConfigList: c.EncryptedClientHelloConfigList,
 		NextProtos:                     c.NextProtos,
 	}
+	if c.VerifyConnection != nil {
+		config.VerifyConnection = func(state utls.ConnectionState) error {
+			return c.VerifyConnection(tls.ConnectionState{
+				Version:                     state.Version,
+				HandshakeComplete:           state.HandshakeComplete,
+				DidResume:                   state.DidResume,
+				CipherSuite:                 state.CipherSuite,
+				NegotiatedProtocol:          state.NegotiatedProtocol,
+				ServerName:                  state.ServerName,
+				PeerCertificates:            state.PeerCertificates,
+				VerifiedChains:              state.VerifiedChains,
+				SignedCertificateTimestamps: state.SignedCertificateTimestamps,
+				OCSPResponse:                state.OCSPResponse,
+				TLSUnique:                   state.TLSUnique,
+				ECHAccepted:                 state.ECHAccepted,
+			})
+		}
+	}
 	return config
 }
 

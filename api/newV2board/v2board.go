@@ -383,10 +383,14 @@ func (c *APIClient) ReportIllegal(detectResultList *[]api.DetectResult) error {
 
 // parseTrojanNodeResponse parse the response for the given nodeInfo format
 func (c *APIClient) parseTrojanNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
+	port, err := api.PortFromInt64(int64(s.ServerPort))
+	if err != nil {
+		return nil, err
+	}
 	return &api.NodeInfo{
 		NodeType:          c.NodeType,
 		NodeID:            c.NodeID,
-		Port:              uint32(s.ServerPort),
+		Port:              port,
 		TransportProtocol: "tcp",
 		EnableTLS:         true,
 		NameServerConfig:  s.parseDNSConfig(),
@@ -396,6 +400,10 @@ func (c *APIClient) parseTrojanNodeResponse(s *serverConfig) (*api.NodeInfo, err
 // parseSSNodeResponse parse the response for the given nodeInfo format
 func (c *APIClient) parseSSNodeResponse(s *serverConfig) (*api.NodeInfo, error) {
 	var header json.RawMessage
+	port, err := api.PortFromInt64(int64(s.ServerPort))
+	if err != nil {
+		return nil, err
+	}
 
 	if s.Obfs == "http" {
 		path := "/"
@@ -415,7 +423,7 @@ func (c *APIClient) parseSSNodeResponse(s *serverConfig) (*api.NodeInfo, error) 
 	return &api.NodeInfo{
 		NodeType:          c.NodeType,
 		NodeID:            c.NodeID,
-		Port:              uint32(s.ServerPort),
+		Port:              port,
 		TransportProtocol: "tcp",
 		CypherMethod:      s.Cipher,
 		ServerKey:         s.ServerKey, // shadowsocks2022 share key

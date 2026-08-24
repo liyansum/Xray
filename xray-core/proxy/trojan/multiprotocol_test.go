@@ -584,32 +584,57 @@ func TestAnyTLSSlowStreamDoesNotBlockSession(t *testing.T) {
 	}
 }
 
-func TestAnyTLSReceiveQueueIsBoundedAndReleased(t *testing.T) {
+func TestAnyTLSReceiveQueueBackpressuresAndReleases(t *testing.T) {
 	serverConn, clientConn := stdnet.Pipe()
 	defer serverConn.Close()
 	defer clientConn.Close()
 	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
 	stream := newAnyTLSStream(1, session)
 
-	var rejected bool
-	for range anyTLSStreamQueuedFrames + 1 {
+	const frameSize = 8192
+	for range anyTLSStreamQueuedBytes / frameSize {
 		payload := buf.NewWithSize(8192)
 		payload.Extend(8192)
 		if err := stream.deliver(payload); err != nil {
 			payload.Release()
-			if err != errAnyTLSReceiveWindowExceeded {
-				t.Fatalf("unexpected queue error: %v", err)
-			}
-			rejected = true
-			break
+			t.Fatalf("failed to fill receive queue: %v", err)
 		}
 	}
-	if !rejected {
-		t.Fatal("stream receive queue exceeded its memory budget")
+	if got := session.budget.queuedBytes.Load(); got != anyTLSStreamQueuedBytes {
+		t.Fatalf("queued %d bytes, want full limit %d", got, anyTLSStreamQueuedBytes)
 	}
-	if got := session.budget.queuedBytes.Load(); got > anyTLSStreamQueuedBytes {
-		t.Fatalf("queued %d bytes, limit %d", got, anyTLSStreamQueuedBytes)
+
+	blockedPayload := buf.NewWithSize(frameSize)
+	blockedPayload.Extend(frameSize)
+	delivered := make(chan error, 1)
+	go func() { delivered <- stream.deliver(blockedPayload) }()
+	select {
+	case err := <-delivered:
+		if err != nil {
+			blockedPayload.Release()
+		}
+		stream.abortRemote()
+		t.Fatalf("delivery did not apply backpressure: %v", err)
+	case <-time.After(25 * time.Millisecond):
 	}
+
+	readBuffer := make([]byte, frameSize)
+	if _, err := io.ReadFull(stream, readBuffer); err != nil {
+		stream.abortRemote()
+		t.Fatal(err)
+	}
+	select {
+	case err := <-delivered:
+		if err != nil {
+			blockedPayload.Release()
+			stream.abortRemote()
+			t.Fatalf("delivery did not resume after queue space was released: %v", err)
+		}
+	case <-time.After(time.Second):
+		stream.abortRemote()
+		t.Fatal("delivery remained blocked after queue space was released")
+	}
+
 	stream.abortRemote()
 	if bytes := session.budget.queuedBytes.Load(); bytes != 0 {
 		t.Fatalf("queue cleanup retained %d bytes", bytes)
@@ -617,6 +642,85 @@ func TestAnyTLSReceiveQueueIsBoundedAndReleased(t *testing.T) {
 	if frames := session.budget.queuedFrames.Load(); frames != 0 {
 		t.Fatalf("queue cleanup retained %d frames", frames)
 	}
+}
+
+func TestAnyTLSBudgetBackpressure(t *testing.T) {
+	tests := []struct {
+		name          string
+		sessionBudget *anyTLSBufferBudget
+		globalBudget  *anyTLSBufferBudget
+	}{
+		{name: "session", sessionBudget: newAnyTLSBufferBudget(1, 1)},
+		{name: "global", sessionBudget: newAnyTLSBufferBudget(2, 2), globalBudget: newAnyTLSBufferBudget(1, 1)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serverConn, clientConn := stdnet.Pipe()
+			defer serverConn.Close()
+			defer clientConn.Close()
+			session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {}, test.globalBudget)
+			session.budget = test.sessionBudget
+			if err := session.reserve(1); err != nil {
+				t.Fatal(err)
+			}
+
+			reserved := make(chan error, 1)
+			go func() { reserved <- session.reserve(1) }()
+			select {
+			case err := <-reserved:
+				session.release(1)
+				t.Fatalf("budget did not apply backpressure: %v", err)
+			case <-time.After(25 * time.Millisecond):
+			}
+
+			session.release(1)
+			select {
+			case err := <-reserved:
+				if err != nil {
+					t.Fatalf("budget reservation did not resume: %v", err)
+				}
+				session.release(1)
+			case <-time.After(time.Second):
+				t.Fatal("budget reservation remained blocked after release")
+			}
+			if bytes := session.budget.queuedBytes.Load(); bytes != 0 {
+				t.Fatalf("session budget retained %d bytes", bytes)
+			}
+			if test.globalBudget != nil && test.globalBudget.queuedBytes.Load() != 0 {
+				t.Fatalf("global budget retained %d bytes", test.globalBudget.queuedBytes.Load())
+			}
+		})
+	}
+}
+
+func TestAnyTLSBudgetWaitStopsWithSession(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	session.budget = newAnyTLSBufferBudget(1, 1)
+	if err := session.reserve(1); err != nil {
+		t.Fatal(err)
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- session.reserve(1) }()
+	select {
+	case err := <-stopped:
+		session.release(1)
+		t.Fatalf("budget did not apply backpressure: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	session.close()
+	select {
+	case err := <-stopped:
+		if err == nil {
+			t.Fatal("budget wait succeeded after the session closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("budget wait did not stop with the session")
+	}
+	session.release(1)
 }
 
 func TestAnyTLSUoTPacket(t *testing.T) {

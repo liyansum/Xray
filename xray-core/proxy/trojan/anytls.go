@@ -48,15 +48,13 @@ const (
 	// Receive queues decouple independent streams without allowing a slow or
 	// malicious peer to grow memory without bound. These are buffering limits,
 	// not limits on the number of active streams.
-	anyTLSStreamQueuedBytes   int64 = 256 * 1024
-	anyTLSStreamQueuedFrames  int64 = 64
-	anyTLSSessionQueuedBytes  int64 = 2 * 1024 * 1024
-	anyTLSSessionQueuedFrames int64 = 512
-	anyTLSGlobalQueuedBytes   int64 = 32 * 1024 * 1024
-	anyTLSGlobalQueuedFrames  int64 = 8192
+	anyTLSStreamQueuedBytes   int64 = 8 * 1024 * 1024
+	anyTLSStreamQueuedFrames  int64 = 2048
+	anyTLSSessionQueuedBytes  int64 = 16 * 1024 * 1024
+	anyTLSSessionQueuedFrames int64 = 4096
+	anyTLSGlobalQueuedBytes   int64 = 64 * 1024 * 1024
+	anyTLSGlobalQueuedFrames  int64 = 16384
 )
-
-var errAnyTLSReceiveWindowExceeded = errors.New("AnyTLS stream receive window exceeded")
 
 var (
 	anyTLSPaddingScheme = []byte("stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000")
@@ -146,38 +144,47 @@ type anyTLSBufferBudget struct {
 	queuedFrames atomic.Int64
 	maxBytes     int64
 	maxFrames    int64
+
+	mu      sync.Mutex
+	waitFor chan struct{}
 }
 
 func newAnyTLSBufferBudget(maxBytes, maxFrames int64) *anyTLSBufferBudget {
 	return &anyTLSBufferBudget{maxBytes: maxBytes, maxFrames: maxFrames}
 }
 
-func (b *anyTLSBufferBudget) reserve(size int64) bool {
+// reserve either accounts one frame or returns a notification that is closed
+// when capacity may be available. Checking the limit and registering the
+// notification under the same lock prevents a release from being missed.
+func (b *anyTLSBufferBudget) reserve(size int64) (bool, <-chan struct{}) {
 	if b == nil {
-		return true
+		return true, nil
 	}
-	if b.queuedFrames.Add(1) > b.maxFrames {
-		b.queuedFrames.Add(-1)
-		return false
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.queuedFrames.Load()+1 > b.maxFrames || b.queuedBytes.Load()+size > b.maxBytes {
+		if b.waitFor == nil {
+			b.waitFor = make(chan struct{})
+		}
+		return false, b.waitFor
 	}
-	if b.queuedBytes.Add(size) > b.maxBytes {
-		b.queuedBytes.Add(-size)
-		b.queuedFrames.Add(-1)
-		return false
-	}
-	return true
+	b.queuedFrames.Add(1)
+	b.queuedBytes.Add(size)
+	return true, nil
 }
 
-func (b *anyTLSBufferBudget) releaseBytes(size int64) {
-	if b != nil && size != 0 {
-		b.queuedBytes.Add(-size)
+func (b *anyTLSBufferBudget) release(size int64) {
+	if b == nil {
+		return
 	}
-}
-
-func (b *anyTLSBufferBudget) releaseFrame() {
-	if b != nil {
-		b.queuedFrames.Add(-1)
+	b.mu.Lock()
+	b.queuedBytes.Add(-size)
+	b.queuedFrames.Add(-1)
+	if b.waitFor != nil {
+		close(b.waitFor)
+		b.waitFor = nil
 	}
+	b.mu.Unlock()
 }
 
 func newAnyTLSServerSession(ctx context.Context, conn stat.Connection, reader io.Reader, activity signal.ActivityUpdater, onStream func(*anyTLSStream), global ...*anyTLSBufferBudget) *anyTLSServerSession {
@@ -245,9 +252,6 @@ func (s *anyTLSServerSession) run() error {
 				stream := s.getStream(streamID)
 				if stream != nil && frameData != nil {
 					if err := stream.deliver(frameData); err != nil {
-						if err == errAnyTLSReceiveWindowExceeded {
-							_ = stream.handshakeFailure(err)
-						}
 						_ = stream.Close()
 					} else {
 						// The stream queue owns the pooled payload now.
@@ -396,6 +400,7 @@ type anyTLSStream struct {
 
 	mu           sync.Mutex
 	ready        *sync.Cond
+	space        *sync.Cond
 	queue        []*buf.Buffer
 	queueHead    int
 	queuedBytes  int64
@@ -407,6 +412,7 @@ type anyTLSStream struct {
 func newAnyTLSStream(id uint32, session *anyTLSServerSession) *anyTLSStream {
 	stream := &anyTLSStream{id: id, session: session}
 	stream.ready = sync.NewCond(&stream.mu)
+	stream.space = sync.NewCond(&stream.mu)
 	return stream
 }
 
@@ -435,8 +441,8 @@ func (s *anyTLSStream) Read(payload []byte) (int, error) {
 		s.queueHead++
 		s.queuedBytes -= memory
 		s.queuedFrames--
-		s.session.releaseBytes(memory)
-		s.session.releaseFrame()
+		s.session.release(memory)
+		s.space.Signal()
 		if s.queueHead == len(s.queue) {
 			s.queue = s.queue[:0]
 			s.queueHead = 0
@@ -458,34 +464,55 @@ func (s *anyTLSStream) Write(payload []byte) (int, error) {
 	return written, nil
 }
 
-// deliver transfers ownership of payload to the stream on success. It never
-// waits for the stream consumer, so one slow destination cannot stall the
-// frame loop for every other stream in the session.
+// deliver transfers ownership of payload to the stream on success. The queue
+// absorbs ordinary scheduling bursts. At its memory boundary, delivery waits
+// for the consumer instead of dropping a reliable byte stream; stopping the
+// session read loop then lets the underlying TCP receive window apply
+// backpressure to an unmodified AnyTLS client.
 func (s *anyTLSStream) deliver(payload *buf.Buffer) error {
 	// Account the backing allocation rather than only logical payload bytes;
 	// bytespool rounds capacities up and the memory bound must remain real.
 	size := int64(payload.Cap())
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.readClosed {
-		return io.ErrClosedPipe
+	for {
+		s.mu.Lock()
+		for !s.readClosed && (s.queuedFrames >= anyTLSStreamQueuedFrames || s.queuedBytes+size > anyTLSStreamQueuedBytes) {
+			s.space.Wait()
+		}
+		if s.readClosed {
+			s.mu.Unlock()
+			return io.ErrClosedPipe
+		}
+		s.mu.Unlock()
+
+		if err := s.session.reserve(size); err != nil {
+			return err
+		}
+
+		s.mu.Lock()
+		if s.readClosed {
+			s.mu.Unlock()
+			s.session.release(size)
+			return io.ErrClosedPipe
+		}
+		// The frame loop normally has a single producer. Recheck the local
+		// limit so deliver remains correct if another producer is introduced.
+		if s.queuedFrames >= anyTLSStreamQueuedFrames || s.queuedBytes+size > anyTLSStreamQueuedBytes {
+			s.mu.Unlock()
+			s.session.release(size)
+			continue
+		}
+		if s.queueHead > 0 && s.queueHead*2 >= len(s.queue) {
+			copy(s.queue, s.queue[s.queueHead:])
+			s.queue = s.queue[:len(s.queue)-s.queueHead]
+			s.queueHead = 0
+		}
+		s.queue = append(s.queue, payload)
+		s.queuedBytes += size
+		s.queuedFrames++
+		s.ready.Signal()
+		s.mu.Unlock()
+		return nil
 	}
-	if s.queuedFrames >= anyTLSStreamQueuedFrames || s.queuedBytes+size > anyTLSStreamQueuedBytes {
-		return errAnyTLSReceiveWindowExceeded
-	}
-	if !s.session.reserve(size) {
-		return errAnyTLSReceiveWindowExceeded
-	}
-	if s.queueHead > 0 && s.queueHead*2 >= len(s.queue) {
-		copy(s.queue, s.queue[s.queueHead:])
-		s.queue = s.queue[:len(s.queue)-s.queueHead]
-		s.queueHead = 0
-	}
-	s.queue = append(s.queue, payload)
-	s.queuedBytes += size
-	s.queuedFrames++
-	s.ready.Signal()
-	return nil
 }
 
 func (s *anyTLSStream) Close() error {
@@ -524,8 +551,7 @@ func (s *anyTLSStream) closeRead(err error, discard bool) {
 	if discard {
 		for s.queueHead < len(s.queue) {
 			queued := s.queue[s.queueHead]
-			s.session.releaseBytes(int64(queued.Cap()))
-			s.session.releaseFrame()
+			s.session.release(int64(queued.Cap()))
 			queued.Release()
 			s.queue[s.queueHead] = nil
 			s.queueHead++
@@ -536,29 +562,43 @@ func (s *anyTLSStream) closeRead(err error, discard bool) {
 		s.queuedFrames = 0
 	}
 	s.ready.Broadcast()
+	s.space.Broadcast()
 	s.mu.Unlock()
 }
 
-func (s *anyTLSServerSession) reserve(size int64) bool {
-	if !s.budget.reserve(size) {
-		return false
+func (s *anyTLSServerSession) reserve(size int64) error {
+	for {
+		reserved, waitForSession := s.budget.reserve(size)
+		if !reserved {
+			select {
+			case <-waitForSession:
+				continue
+			case <-s.closed:
+				return io.ErrClosedPipe
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			}
+		}
+
+		reserved, waitForGlobal := s.global.reserve(size)
+		if reserved {
+			return nil
+		}
+		s.budget.release(size)
+		select {
+		case <-waitForGlobal:
+			continue
+		case <-s.closed:
+			return io.ErrClosedPipe
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
 	}
-	if !s.global.reserve(size) {
-		s.budget.releaseBytes(size)
-		s.budget.releaseFrame()
-		return false
-	}
-	return true
 }
 
-func (s *anyTLSServerSession) releaseBytes(size int64) {
-	s.budget.releaseBytes(size)
-	s.global.releaseBytes(size)
-}
-
-func (s *anyTLSServerSession) releaseFrame() {
-	s.budget.releaseFrame()
-	s.global.releaseFrame()
+func (s *anyTLSServerSession) release(size int64) {
+	s.budget.release(size)
+	s.global.release(size)
 }
 
 func (s *anyTLSStream) handshakeSuccess() error {

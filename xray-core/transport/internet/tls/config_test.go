@@ -75,15 +75,12 @@ func TestInsecureCertificates(t *testing.T) {
 	}
 }
 
-func TestServerCertificateCipherSuitesUseForwardSecretAEAD(t *testing.T) {
+func TestServerCertificateCipherSuitesUseECDSAAEAD(t *testing.T) {
 	tlsConfig := (&Config{Certificate: []*Certificate{{}}}).GetTLSConfig()
 	want := map[uint16]bool{
 		gotls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:       true,
 		gotls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:       true,
 		gotls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: true,
-		gotls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:         true,
-		gotls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:         true,
-		gotls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:   true,
 	}
 	for _, suite := range tlsConfig.CipherSuites {
 		if !want[suite] {

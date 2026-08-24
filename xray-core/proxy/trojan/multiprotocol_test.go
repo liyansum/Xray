@@ -1208,7 +1208,7 @@ func TestAnyTLSWriteMultiBufferPacksPoolAlignedFrames(t *testing.T) {
 		received = append(received, payload...)
 	}
 	if !bytes.Equal(received, expected) {
-		t.Fatal("coalesced AnyTLS frames changed payload contents or order")
+		t.Fatal("packed AnyTLS frames changed payload contents or order")
 	}
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)

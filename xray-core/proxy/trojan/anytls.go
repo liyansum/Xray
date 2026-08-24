@@ -343,9 +343,9 @@ func (s *anyTLSServerSession) writeControlFrameBounded(command byte, streamID ui
 	return s.writeFrameLocked(command, streamID, data)
 }
 
-// writeDataFrames serializes the complete Stream.Write operation. A payload
-// larger than the uint16 wire limit is split into multiple PSH frames without
-// allowing another stream or control frame to be inserted between its chunks.
+// writeDataFrames serializes the complete Stream.Write operation. Payloads
+// larger than the pool-aligned frame capacity are split into multiple PSH
+// frames without allowing another stream or control frame between chunks.
 func (s *anyTLSServerSession) writeDataFrames(streamID uint32, data []byte) (int, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

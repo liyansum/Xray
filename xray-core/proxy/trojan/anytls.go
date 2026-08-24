@@ -43,7 +43,6 @@ const (
 
 	anyTLSFrameHeaderSize = 7
 	anyTLSUoTMagic        = "sp.v2.udp-over-tcp.arpa"
-	anyTLSStreamIDError   = "AnyTLS stream ID is not strictly increasing"
 )
 
 var (
@@ -123,7 +122,6 @@ type anyTLSServerSession struct {
 
 	receivedSettings bool
 	peerVersion      int
-	lastPeerStreamID uint32
 }
 
 func newAnyTLSServerSession(_ context.Context, conn stat.Connection, reader io.Reader, activity signal.ActivityUpdater, onStream func(*anyTLSStream)) *anyTLSServerSession {
@@ -178,10 +176,7 @@ func (s *anyTLSServerSession) run() error {
 				if length != 0 || streamID == 0 {
 					return errors.New("invalid AnyTLS SYN frame")
 				}
-				if err := s.openStream(streamID); err != nil {
-					_ = s.writeFrame(anyTLSCmdAlert, 0, []byte(anyTLSStreamIDError))
-					return err
-				}
+				s.openStream(streamID)
 			case anyTLSCmdPSH:
 				stream := s.getStream(streamID)
 				if stream != nil && frameData != nil {
@@ -248,13 +243,12 @@ func (s *anyTLSServerSession) handleSettings(data []byte) error {
 	return nil
 }
 
-func (s *anyTLSServerSession) openStream(id uint32) error {
+func (s *anyTLSServerSession) openStream(id uint32) {
 	s.mu.Lock()
-	if id <= s.lastPeerStreamID {
+	if _, exists := s.streams[id]; exists {
 		s.mu.Unlock()
-		return errors.New(anyTLSStreamIDError)
+		return
 	}
-	s.lastPeerStreamID = id
 	stream := newAnyTLSStream(id, s)
 	s.streams[id] = stream
 	s.wg.Add(1)
@@ -264,7 +258,6 @@ func (s *anyTLSServerSession) openStream(id uint32) error {
 		defer stream.Close()
 		s.onStream(stream)
 	}()
-	return nil
 }
 
 func (s *anyTLSServerSession) getStream(id uint32) *anyTLSStream {
@@ -369,6 +362,13 @@ func (s *anyTLSStream) Write(payload []byte) (int, error) {
 		payload = payload[length:]
 	}
 	return written, nil
+}
+
+// WriteMultiBuffer keeps Xray's stream batches contiguous instead of turning
+// every 8 KiB buffer into an independent AnyTLS/TLS write. A single AnyTLS
+// frame can carry at most 65535 bytes.
+func (s *anyTLSStream) WriteMultiBuffer(payload buf.MultiBuffer) error {
+	return buf.WriteMultiBufferCoalesced(s, payload, 65535)
 }
 
 // deliver follows the official AnyTLS/sing-box stream model: each stream has

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	stdnet "net"
 	"strings"
@@ -462,48 +463,82 @@ func TestAnyTLSV1Session(t *testing.T) {
 	}
 }
 
-func TestAnyTLSRejectsNonIncreasingStreamID(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		streamIDs []uint32
-	}{
-		{name: "duplicate", streamIDs: []uint32{2, 2}},
-		{name: "decreasing", streamIDs: []uint32{2, 1}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
+func TestAnyTLSV1V2AcceptOutOfOrderStreamIDs(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			serverConn, clientConn := stdnet.Pipe()
 			defer clientConn.Close()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			session := newAnyTLSServerSession(ctx, serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+			opened := make(chan uint32, 4)
+			handlerErrors := make(chan error, 4)
+			release := make(chan struct{})
+			session := newAnyTLSServerSession(ctx, serverConn, serverConn, testActivity{}, func(stream *anyTLSStream) {
+				opened <- stream.id
+				handlerErrors <- stream.handshakeSuccess()
+				<-release
+			})
 			done := make(chan error, 1)
 			go func() { done <- session.run() }()
 
-			settings := []byte("v=2\nclient=xray-test\npadding-md5=" + anyTLSPaddingMD5)
+			settings := []byte(fmt.Sprintf("v=%d\nclient=xray-test\npadding-md5=%s", version, anyTLSPaddingMD5))
 			writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSettings, 0, settings)
-			if command, _, _ := readTestAnyTLSFrame(t, clientConn); command != anyTLSCmdServerSetting {
-				t.Fatalf("unexpected server settings command: %d", command)
+			if version >= 2 {
+				if command, _, _ := readTestAnyTLSFrame(t, clientConn); command != anyTLSCmdServerSetting {
+					t.Fatalf("unexpected server settings command: %d", command)
+				}
 			}
 
-			writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, test.streamIDs[0], nil)
-			if command, streamID, _ := readTestAnyTLSFrame(t, clientConn); command != anyTLSCmdFIN || streamID != test.streamIDs[0] {
-				t.Fatalf("unexpected first stream response: command=%d stream=%d", command, streamID)
+			writeSYN := func(streamID uint32, expectSYNACK bool) {
+				writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, streamID, nil)
+				if expectSYNACK {
+					command, responseStreamID, data := readTestAnyTLSFrame(t, clientConn)
+					if command != anyTLSCmdSYNACK || responseStreamID != streamID || len(data) != 0 {
+						t.Fatalf("SYN %d response: command=%d stream=%d data=%q", streamID, command, responseStreamID, data)
+					}
+				}
 			}
 
-			writeTestAnyTLSFrame(t, clientConn, anyTLSCmdSYN, test.streamIDs[1], nil)
-			command, streamID, data := readTestAnyTLSFrame(t, clientConn)
-			if command != anyTLSCmdAlert || streamID != 0 || string(data) != "AnyTLS stream ID is not strictly increasing" {
-				t.Fatalf("unexpected invalid-ID response: command=%d stream=%d data=%q", command, streamID, data)
-			}
+			writeSYN(2, version >= 2)
+			writeSYN(1, version >= 2) // Legal concurrent arrival after stream 2.
+			writeSYN(2, false)        // Active duplicate is ignored by official servers.
+			writeSYN(3, version >= 2) // Session must remain usable after both cases.
 
+			openedIDs := make(map[uint32]bool, 3)
+			for range 3 {
+				select {
+				case streamID := <-opened:
+					openedIDs[streamID] = true
+				case <-time.After(time.Second):
+					t.Fatal("out-of-order AnyTLS stream did not open")
+				}
+			}
+			if !openedIDs[1] || !openedIDs[2] || !openedIDs[3] {
+				t.Fatalf("opened stream IDs=%v", openedIDs)
+			}
+			select {
+			case duplicateID := <-opened:
+				t.Fatalf("active duplicate SYN created another stream %d", duplicateID)
+			case <-time.After(25 * time.Millisecond):
+			}
+			for range 3 {
+				if err := <-handlerErrors; err != nil {
+					t.Fatal(err)
+				}
+			}
 			select {
 			case err := <-done:
-				if err == nil || !strings.Contains(err.Error(), "stream ID is not strictly increasing") {
-					t.Fatalf("unexpected session result: %v", err)
-				}
+				t.Fatalf("out-of-order SYN killed the AnyTLS session: %v", err)
+			default:
+			}
+
+			_ = clientConn.Close()
+			close(release)
+			select {
+			case <-done:
 			case <-time.After(time.Second):
-				t.Fatal("AnyTLS session remained open after an invalid stream ID")
+				t.Fatal("AnyTLS session did not stop")
 			}
 		})
 	}
@@ -844,6 +879,44 @@ func TestAnyTLSConcurrentDownlinkThroughput(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("AnyTLS session did not stop after downlink throughput test")
 	}
+}
+
+func TestAnyTLSWriteMultiBufferCoalescesFrames(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(7, session)
+
+	parts := [][]byte{
+		bytes.Repeat([]byte{1}, 24*1024),
+		bytes.Repeat([]byte{2}, 24*1024),
+		bytes.Repeat([]byte{3}, 24*1024),
+	}
+	expected := bytes.Join(parts, nil)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- stream.WriteMultiBuffer(buf.MultiBuffer{
+			buf.FromBytes(parts[0]),
+			buf.FromBytes(parts[1]),
+			buf.FromBytes(parts[2]),
+		})
+	}()
+
+	var received []byte
+	for _, expectedLength := range []int{65535, len(expected) - 65535} {
+		command, streamID, payload := readTestAnyTLSFrame(t, clientConn)
+		if command != anyTLSCmdPSH || streamID != stream.id || len(payload) != expectedLength {
+			t.Fatalf("frame command=%d stream=%d length=%d, want PSH stream=%d length=%d", command, streamID, len(payload), stream.id, expectedLength)
+		}
+		received = append(received, payload...)
+	}
+	if !bytes.Equal(received, expected) {
+		t.Fatal("coalesced AnyTLS frames changed payload contents or order")
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	session.close()
 }
 
 func TestAnyTLSUoTPacket(t *testing.T) {

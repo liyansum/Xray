@@ -46,9 +46,9 @@
 
 UDP/443 在服务端没有特殊封锁，QUIC 与其他 UDP 目标使用同一派发、路由和统计路径。官方 Xray 客户端使用 Vision 时，可将客户端账户 flow 配置为 `xtls-rprx-vision-udp443`；客户端会在发送前将它归一化为线上协议中的 `xtls-rprx-vision`，服务端也兼容直接收到两种写法。如果客户端还启用了通用 outbound Mux，其版本可能另有 `xudpProxyUDP443` 开关，应设置为 `allow`，或使用 `skip` 绕过该层后交给 VLESS Vision 自身的 XUDP。其他客户端必须确认其 Vision 实现能够发送普通 VLESS UDP 或 XUDP，并允许 UDP/443；仅服务端放行无法绕过客户端自身的发送限制。
 
-AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。客户端新建 stream 的 ID 必须严格递增（无需连续），重复或倒退会在已鉴权的加密会话内返回标准 Alert 并关闭该会话；服务端不限制同时活跃的 stream 数量。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
+AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。客户端按规范为 stream 分配单调递增的 ID；服务端与官方 AnyTLS、sing-anytls 一致，不把不同 ID 的 SYN 到达次序作为 session 级致命错误，并静默忽略当前仍活跃 ID 的重复 SYN。服务端不限制同时活跃的 stream 数量。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
 
-AnyTLS 接收端采用官方 AnyTLS 和 sing-box 相同的同步 stream 模型：每条 stream 对应一个无内部队列的同步 pipe，PSH 数据被该 stream 的处理协程消费后，会话才继续读取下一帧。内存反压直接沿 pipe、TLS 和 TCP 接收窗口传回客户端，不再使用项目自定义的单 stream、单会话或全局缓存预算。按照 AnyTLS 的常规使用方式，客户端通常为一次代理请求打开一个 session stream；同一 session 中未消费数据的 stream 会阻塞后续帧。用户限速在 UDP 路径上按完整数据报等待令牌，不会为了适配令牌桶 burst 而拆分游戏或 QUIC 数据报。
+AnyTLS 接收端采用官方 AnyTLS 和 sing-box 相同的同步 stream 模型：每条 stream 对应一个无内部队列的同步 pipe，PSH 数据被该 stream 的处理协程消费后，会话才继续读取下一帧。内存反压直接沿 pipe、TLS 和 TCP 接收窗口传回客户端，不再使用项目自定义的单 stream、单会话或全局缓存预算。下行会把 Xray 的 `MultiBuffer` 连续合并到协议允许的 65535 字节 PSH 帧，避免把每个 8 KiB 内部 buffer 变成独立 TLS 写入而在高 RTT 链路上严重限制 TCP 发送窗口。按照 AnyTLS 的常规使用方式，客户端通常为一次代理请求打开一个 session stream；同一 session 中未消费数据的 stream 会阻塞后续帧。用户限速在 UDP 路径上按完整数据报等待令牌，不会为了适配令牌桶 burst 而拆分游戏或 QUIC 数据报。
 
 ## 面板与节点配置
 

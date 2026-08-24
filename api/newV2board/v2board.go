@@ -1,6 +1,7 @@
 package newV2board
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ type APIClient struct {
 	AliveMap      *AliveMap
 	aliveSource   aliveSource
 	lastUserList  []api.UserInfo
+	hasUserList   bool
 }
 
 type aliveSource uint8
@@ -185,21 +187,26 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode users response: %w", err)
 	}
+	// liyansum/v2board returns an explicit empty JSON array when no users are
+	// available. That is a valid authoritative snapshot and must revoke every
+	// locally registered user. Keep missing, null and non-array values as errors
+	// so a malformed or partial panel response cannot accidentally revoke all
+	// users.
+	usersJSON := bytes.TrimSpace(b)
+	if len(usersJSON) == 0 || usersJSON[0] != '[' {
+		return nil, errors.New("users must be a JSON array")
+	}
 	if err := json.Unmarshal(b, &users); err != nil {
 		return nil, fmt.Errorf("unmarshal users response: %w", err)
 	}
-	if len(users) == 0 {
-		return nil, errors.New("users is null")
-	}
-	if etag := res.Header().Get("Etag"); etag != "" {
-		c.eTags["users"] = etag
-	}
-
 	var deviceLimit int
 	userList := make([]api.UserInfo, 0, len(users))
 	embeddedAlive := make(map[int]int)
 	hasEmbeddedAlive := false
-	for _, user := range users {
+	for index, user := range users {
+		if user == nil {
+			return nil, fmt.Errorf("user %d is null", index)
+		}
 		u := api.UserInfo{
 			UID:  user.Id,
 			UUID: user.Uuid,
@@ -229,6 +236,9 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 
 		userList = append(userList, u)
 	}
+	if etag := res.Header().Get("Etag"); etag != "" {
+		c.eTags["users"] = etag
+	}
 
 	if hasEmbeddedAlive {
 		// Legacy panel: alive_ip is part of /user. Do not probe an endpoint that
@@ -244,7 +254,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		_, _ = c.GetUserAlive()
 	}
 
-	if slices.Equal(c.lastUserList, userList) {
+	if c.hasUserList && slices.Equal(c.lastUserList, userList) {
 		// Old panels include alive_ip in the user ETag. Avoid rebuilding users and
 		// counters when only the online-device snapshot changed.
 		return nil, errors.New(api.UserNotModified)
@@ -253,6 +263,7 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	// Reusing its backing array would retain both the allocation and stale string
 	// references beyond the new slice length.
 	c.lastUserList = slices.Clone(userList)
+	c.hasUserList = true
 
 	return &userList, nil
 }

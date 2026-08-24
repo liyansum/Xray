@@ -48,7 +48,7 @@ UDP/443 在服务端没有特殊封锁，QUIC 与其他 UDP 目标使用同一�
 
 AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。客户端新建 stream 的 ID 必须严格递增（无需连续），重复或倒退会在已鉴权的加密会话内返回标准 Alert 并关闭该会话；服务端不限制同时活跃的 stream 数量。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
 
-AnyTLS 接收端为每条 stream 使用独立的非阻塞队列，慢目标不会阻塞同一 TLS 会话中的其他 stream。队列按底层缓冲区的真实分配容量计费，单 stream 最多缓存 256 KiB/64 帧、单会话最多 2 MiB/512 帧、单个入站实例合计最多 32 MiB/8192 帧；达到窗口时只关闭对应 stream（v2 会在加密会话内返回带错误的 SYNACK）。这些是待处理数据的内存窗口，不是活跃 stream 数量限制。用户限速在 UDP 路径上按完整数据报等待令牌，不会为了适配令牌桶 burst 而拆分游戏或 QUIC 数据报。
+AnyTLS 接收端为每条 stream 使用独立队列，并按底层缓冲区的真实分配容量计费：单 stream 最多缓存 8 MiB/2048 帧、单会话最多 16 MiB/4096 帧、单个入站实例合计最多 64 MiB/16384 帧。达到任一窗口时，接收循环等待消费端释放空间，让底层 TCP 接收窗口向客户端施加反压；等待期间同一 TLS 会话中的其他 stream 也可能暂停接收，不会丢弃已经认证的可靠字节流。这些是待处理数据的内存窗口，不是活跃 stream 数量限制；每个 Trojan 入站实例使用独立的 64 MiB 总预算。用户限速在 UDP 路径上按完整数据报等待令牌，不会为了适配令牌桶 burst 而拆分游戏或 QUIC 数据报。
 
 ## 面板与节点配置
 
@@ -102,7 +102,7 @@ Nodes:
 
 文档和部署兼容基线为 `liyansum/v2board` 的 `master` 分支，基线提交是 `074dd516cd3f936908d8905b8fae89c0d6114c49`（2024-12-29）。该仓库 fork 自 [wyx2685/v2board](https://github.com/wyx2685/v2board)。截至 2026-08-24，检查的上游提交 `3cfb3f0d318e7158a0394e247e1479622cd21d3e` 所提供的 UniProxy JSON 接口与本项目使用的 Trojan 字段仍保持代码级兼容，但没有将该上游版本作为生产部署组合进行完整验证；已有面板不要仅依据代码级兼容结论直接升级，应先备份并在测试环境验证数据库迁移、缓存、队列和用户/流量上报。
 
-`NewV2board` 适配器会自动兼容两种设备统计接口：旧版面板（已验证 `71bb51d395cd939a04630df68b4ce05f87e164ca`）从 `/UniProxy/user` 的 `alive_ip` 字段读取，新版面板从独立的 `/UniProxy/alivelist` 读取。旧版不会额外请求不存在的接口；新版在用户列表返回 `304 Not Modified` 时仍会刷新在线设备数。临时面板错误会保留最后一次有效快照，设备限制按“面板已有设备数 + 当前统计周期新增 IP”原子判断。`ApiConfig.DeviceLimit: 0` 表示使用面板为各用户配置的限制，并非关闭设备限制。旧版面板只为本身已设置设备限制的用户返回 `alive_ip`，因此旧版组合应保持 `DeviceLimit: 0` 并在面板用户侧配置限制。
+`NewV2board` 适配器会自动兼容两种设备统计接口：旧版面板（已验证 `71bb51d395cd939a04630df68b4ce05f87e164ca`）从 `/UniProxy/user` 的 `alive_ip` 字段读取，新版面板从独立的 `/UniProxy/alivelist` 读取。旧版不会额外请求不存在的接口；新版在用户列表返回 `304 Not Modified` 时仍会刷新在线设备数。`liyansum/v2board` 在没有可用用户时会返回带 ETag 的显式 `{"users":[]}`；该空数组是权威快照，适配器会删除本节点的全部现有用户，使 Trojan、VLESS 和 AnyTLS 凭据同步撤销。缺失、`null` 或类型错误的 `users` 字段仍视为临时面板错误并保留最后一次有效快照，避免残缺响应误触发全量撤权。设备限制按“面板已有设备数 + 当前统计周期新增 IP”原子判断。`ApiConfig.DeviceLimit: 0` 表示使用面板为各用户配置的限制，并非关闭设备限制。旧版面板只为本身已设置设备限制的用户返回 `alive_ip`，因此旧版组合应保持 `DeviceLimit: 0` 并在面板用户侧配置限制。
 
 ### 其他面板
 
@@ -167,6 +167,15 @@ Vision 数据路径来自 MPL-2.0 的 Xray-core。AnyTLS v1/v2 和 UoT v2 依据
 git clone https://github.com/liyansum/Xray.git
 cd Xray
 ./build.sh
+```
+
+本机专用部署将合并项目的产物和校验文件放在仓库外的统一目录，避免与仓库根目录中可能存在的旧二进制混淆：
+
+```bash
+mkdir -p /root/code/Xray/dist
+BINARY=/root/code/Xray/dist/XrayR-linux-amd64-v3 ./build.sh
+cd /root/code/Xray/dist
+sha256sum XrayR-linux-amd64-v3 > XrayR-linux-amd64-v3.sha256
 ```
 
 默认生成静态 Linux amd64-v3 二进制，构建参数包括：

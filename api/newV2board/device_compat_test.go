@@ -99,6 +99,87 @@ func TestNewPanelRefreshesAliveListOnUser304(t *testing.T) {
 	}
 }
 
+func TestEmptyUserListIsAuthoritativeSnapshot(t *testing.T) {
+	var empty atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/server/UniProxy/user":
+			writer.Header().Set("Content-Type", "application/json")
+			if empty.Load() {
+				writer.Header().Set("ETag", `"users-empty"`)
+				fmt.Fprint(writer, `{"users":[]}`)
+				return
+			}
+			writer.Header().Set("ETag", `"users-one"`)
+			fmt.Fprintf(writer, `{"users":[{"id":1,"uuid":%q,"speed_limit":0,"device_limit":0}]}`, deviceTestUUID)
+		case "/api/v1/server/UniProxy/alivelist":
+			writer.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(writer, `{"alive":{}}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	client := newDeviceTestClient(server)
+	users, err := client.GetUserList()
+	if err != nil || len(*users) != 1 {
+		t.Fatalf("initial user snapshot failed: users=%v err=%v", users, err)
+	}
+
+	empty.Store(true)
+	users, err = client.GetUserList()
+	if err != nil {
+		t.Fatalf("empty user snapshot was rejected: %v", err)
+	}
+	if users == nil || len(*users) != 0 {
+		t.Fatalf("empty user snapshot was not returned: %#v", users)
+	}
+	if users, err = client.GetUserList(); err == nil || err.Error() != api.UserNotModified || users != nil {
+		t.Fatalf("unchanged empty snapshot rebuilt users: users=%v err=%v", users, err)
+	}
+}
+
+func TestInitialEmptyUserListIsNotNotModified(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/api/v1/server/UniProxy/user":
+			writer.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(writer, `{"users":[]}`)
+		case "/api/v1/server/UniProxy/alivelist":
+			writer.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(writer, `{"alive":{}}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	users, err := newDeviceTestClient(server).GetUserList()
+	if err != nil {
+		t.Fatalf("initial empty snapshot failed: %v", err)
+	}
+	if users == nil || len(*users) != 0 {
+		t.Fatalf("initial empty snapshot was not returned: %#v", users)
+	}
+}
+
+func TestMalformedUserListDoesNotBecomeEmptySnapshot(t *testing.T) {
+	for _, body := range []string{`{}`, `{"users":null}`, `{"users":{}}`, `{"users":[null]}`} {
+		t.Run(body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(writer, body)
+			}))
+			defer server.Close()
+
+			if users, err := newDeviceTestClient(server).GetUserList(); err == nil || users != nil {
+				t.Fatalf("malformed snapshot was accepted: users=%v err=%v", users, err)
+			}
+		})
+	}
+}
+
 func TestAliveEndpointFailurePreservesLastSnapshot(t *testing.T) {
 	var fail atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

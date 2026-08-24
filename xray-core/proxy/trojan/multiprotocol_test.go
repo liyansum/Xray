@@ -893,6 +893,97 @@ func TestAnyTLSSynchronousPipeHasNoReceiveQueue(t *testing.T) {
 	stream.abortRemote()
 }
 
+func TestAnyTLSReadMultiBufferUses32KiBBatches(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(1, session)
+
+	expected := bytes.Repeat([]byte{0x5a}, 65535)
+	payload := buf.FromBytes(expected)
+	delivered := make(chan error, 1)
+	go func() { delivered <- stream.deliver(payload) }()
+
+	first, err := stream.ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstLength := first.Len()
+	if firstLength != anyTLSReadBatchSize || !bytes.Equal(first[0].Bytes(), expected[:anyTLSReadBatchSize]) {
+		buf.ReleaseMulti(first)
+		t.Fatalf("first AnyTLS uplink batch has length %d, want %d", firstLength, anyTLSReadBatchSize)
+	}
+	buf.ReleaseMulti(first)
+	select {
+	case err := <-delivered:
+		stream.abortRemote()
+		t.Fatalf("delivery returned before the complete PSH was consumed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	second, err := stream.ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSecond := len(expected) - anyTLSReadBatchSize
+	secondLength := second.Len()
+	if secondLength != int32(wantSecond) || !bytes.Equal(second[0].Bytes(), expected[anyTLSReadBatchSize:]) {
+		buf.ReleaseMulti(second)
+		t.Fatalf("second AnyTLS uplink batch has length %d, want %d", secondLength, wantSecond)
+	}
+	buf.ReleaseMulti(second)
+	select {
+	case err := <-delivered:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delivery remained blocked after the complete PSH was consumed")
+	}
+	stream.abortRemote()
+}
+
+func TestAnyTLSReadMultiBufferPreservesHeaderRemainder(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(1, session)
+
+	expected := bytes.Repeat([]byte{0x6b}, anyTLSReadBatchSize+17)
+	payload := buf.FromBytes(expected)
+	delivered := make(chan error, 1)
+	go func() { delivered <- stream.deliver(payload) }()
+
+	header := make([]byte, 7)
+	if _, err := io.ReadFull(stream, header); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(header, expected[:len(header)]) {
+		t.Fatal("AnyTLS stream header read changed payload contents")
+	}
+
+	var received []byte
+	for len(received) < len(expected)-len(header) {
+		batch, err := stream.ReadMultiBuffer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, part := range batch {
+			received = append(received, part.Bytes()...)
+		}
+		buf.ReleaseMulti(batch)
+	}
+	if !bytes.Equal(received, expected[len(header):]) {
+		t.Fatal("AnyTLS MultiBuffer reads lost the remainder after header parsing")
+	}
+	if err := <-delivered; err != nil {
+		t.Fatal(err)
+	}
+	stream.abortRemote()
+}
+
 func TestAnyTLSConcurrentUplinkThroughput(t *testing.T) {
 	const (
 		streamCount    = 8

@@ -44,6 +44,7 @@ const (
 
 	anyTLSFrameHeaderSize = 7
 	anyTLSUoTMagic        = "sp.v2.udp-over-tcp.arpa"
+	anyTLSReadBatchSize   = 32 * 1024
 	anyTLSWriteBatchSize  = 32 * 1024
 	anyTLSControlTimeout  = 5 * time.Second
 )
@@ -402,6 +403,22 @@ func (s *anyTLSStream) Read(payload []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// ReadMultiBuffer lets Xray consume AnyTLS uplink data in the same 32 KiB
+// batches used by the downlink writer. Without this implementation,
+// buf.NewReader wraps the stream in SingleReader and splits every peer PSH
+// into 8 KiB reads, multiplying pipe rendezvous, copies and accounting work.
+// Reading through the synchronous pipe still blocks the session until the
+// complete PSH has been consumed, preserving the official backpressure model.
+func (s *anyTLSStream) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	payload := buf.NewWithSize(anyTLSReadBatchSize)
+	read, err := payload.ReadFrom(s)
+	if read == 0 {
+		payload.Release()
+		return nil, err
+	}
+	return buf.MultiBuffer{payload}, err
 }
 
 func (s *anyTLSStream) Write(payload []byte) (int, error) {

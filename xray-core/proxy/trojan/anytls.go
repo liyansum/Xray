@@ -42,11 +42,12 @@ const (
 	anyTLSCmdHeartResponse byte = 9
 	anyTLSCmdServerSetting byte = 10
 
-	anyTLSFrameHeaderSize = 7
-	anyTLSUoTMagic        = "sp.v2.udp-over-tcp.arpa"
-	anyTLSReadBatchSize   = 32 * 1024
-	anyTLSWriteBatchSize  = 32 * 1024
-	anyTLSControlTimeout  = 5 * time.Second
+	anyTLSFrameHeaderSize  = 7
+	anyTLSFrameBufferSize  = 32 * 1024
+	anyTLSFramePayloadSize = anyTLSFrameBufferSize - anyTLSFrameHeaderSize
+	anyTLSUoTMagic         = "sp.v2.udp-over-tcp.arpa"
+	anyTLSReadBatchSize    = 32 * 1024
+	anyTLSControlTimeout   = 5 * time.Second
 )
 
 var (
@@ -280,14 +281,22 @@ func (s *anyTLSServerSession) removeStream(id uint32) *anyTLSStream {
 	return stream
 }
 
-func (s *anyTLSServerSession) writeFrameLocked(command byte, streamID uint32, data []byte) error {
-	if len(data) > 65535 {
-		return errors.New("AnyTLS frame payload is too large")
-	}
+func (s *anyTLSServerSession) writePreparedFrameLocked(frame *buf.Buffer) error {
 	select {
 	case <-s.closed:
 		return io.ErrClosedPipe
 	default:
+	}
+	if err := buf.WriteAllBytes(s.conn, frame.Bytes(), nil); err != nil {
+		return errors.New("failed to write AnyTLS frame").Base(err)
+	}
+	s.activity.Update()
+	return nil
+}
+
+func (s *anyTLSServerSession) writeFrameLocked(command byte, streamID uint32, data []byte) error {
+	if len(data) > 65535 {
+		return errors.New("AnyTLS frame payload is too large")
 	}
 	frame := buf.NewWithSize(int32(anyTLSFrameHeaderSize + len(data)))
 	defer frame.Release()
@@ -298,11 +307,7 @@ func (s *anyTLSServerSession) writeFrameLocked(command byte, streamID uint32, da
 	if _, err := frame.Write(data); err != nil {
 		return err
 	}
-	if err := buf.WriteAllBytes(s.conn, frame.Bytes(), nil); err != nil {
-		return errors.New("failed to write AnyTLS frame").Base(err)
-	}
-	s.activity.Update()
-	return nil
+	return s.writePreparedFrameLocked(frame)
 }
 
 // writeControlFrame bounds control-plane writes so an unresponsive peer cannot
@@ -346,7 +351,7 @@ func (s *anyTLSServerSession) writeDataFrames(streamID uint32, data []byte) (int
 	defer s.writeMu.Unlock()
 	written := 0
 	for len(data) > 0 {
-		length := min(len(data), 65535)
+		length := min(len(data), anyTLSFramePayloadSize)
 		if err := s.writeFrameLocked(anyTLSCmdPSH, streamID, data[:length]); err != nil {
 			return written, err
 		}
@@ -354,6 +359,47 @@ func (s *anyTLSServerSession) writeDataFrames(streamID uint32, data []byte) (int
 		data = data[length:]
 	}
 	return written, nil
+}
+
+// writeMultiBufferFrames builds AnyTLS PSH frames directly from Xray buffers.
+// The framed buffer is allocated only after acquiring the session write lock
+// and reused for the complete call, avoiding both the 32 KiB coalescing scratch
+// and the 128 KiB pool jump caused by a 32 KiB payload plus its 7-byte header.
+func (s *anyTLSServerSession) writeMultiBufferFrames(stream *anyTLSStream, payload buf.MultiBuffer) error {
+	defer func() { buf.ReleaseMulti(payload) }()
+	if payload.IsEmpty() {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	requestedSize := min(anyTLSFrameBufferSize, int(payload.Len())+anyTLSFrameHeaderSize)
+	frame := buf.NewWithSize(int32(requestedSize))
+	defer frame.Release()
+	for !payload.IsEmpty() {
+		// WriteMultiBufferCoalesced used to call stream.Write once per batch,
+		// so preserve its per-frame deadline and stream-close checks.
+		if err := stream.checkWritable(); err != nil {
+			return err
+		}
+		frame.Clear()
+		writable := frame.WritableBytes()
+		payloadCapacity := min(len(writable)-anyTLSFrameHeaderSize, anyTLSFramePayloadSize)
+		var copied int
+		payload, copied = buf.SplitBytes(payload, writable[anyTLSFrameHeaderSize:anyTLSFrameHeaderSize+payloadCapacity])
+		if copied == 0 {
+			return io.ErrNoProgress
+		}
+		header := writable[:anyTLSFrameHeaderSize]
+		header[0] = anyTLSCmdPSH
+		binary.BigEndian.PutUint32(header[1:5], stream.id)
+		binary.BigEndian.PutUint16(header[5:7], uint16(copied))
+		frame.Commit(int32(anyTLSFrameHeaderSize + copied))
+		if err := s.writePreparedFrameLocked(frame); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *anyTLSServerSession) close() {
@@ -422,22 +468,31 @@ func (s *anyTLSStream) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 func (s *anyTLSStream) Write(payload []byte) (int, error) {
-	select {
-	case <-s.writeDeadline.wait():
-		return 0, os.ErrDeadlineExceeded
-	default:
-	}
-	if dieErr := s.loadError(); dieErr != nil {
-		return 0, dieErr
+	if err := s.checkWritable(); err != nil {
+		return 0, err
 	}
 	return s.session.writeDataFrames(s.id, payload)
 }
 
-// WriteMultiBuffer keeps Xray's stream batches contiguous instead of turning
-// every 8 KiB buffer into an independent AnyTLS/TLS write. Keep the regular
-// batch aligned with the TLS stream writer and below the 65535-byte PSH limit.
+func (s *anyTLSStream) checkWritable() error {
+	select {
+	case <-s.writeDeadline.wait():
+		return os.ErrDeadlineExceeded
+	default:
+	}
+	if dieErr := s.loadError(); dieErr != nil {
+		return dieErr
+	}
+	return nil
+}
+
+// WriteMultiBuffer packs Xray buffers directly into pool-aligned AnyTLS frames.
 func (s *anyTLSStream) WriteMultiBuffer(payload buf.MultiBuffer) error {
-	return buf.WriteMultiBufferCoalesced(s, payload, anyTLSWriteBatchSize)
+	if err := s.checkWritable(); err != nil {
+		buf.ReleaseMulti(payload)
+		return err
+	}
+	return s.session.writeMultiBufferFrames(s, payload)
 }
 
 // deliver follows the official AnyTLS/sing-box stream model: each stream has

@@ -17,9 +17,11 @@ import (
 
 	"google.golang.org/protobuf/encoding/protowire"
 
+	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	internetstat "github.com/xtls/xray-core/transport/internet/stat"
 )
 
 const testUUID = "550e8400-e29b-41d4-a716-446655440000"
@@ -553,11 +555,11 @@ func TestAnyTLSLargeWriteFramesStayContiguous(t *testing.T) {
 	}
 
 	writes := conn.recordedWrites()
-	if len(writes) != 3 {
-		t.Fatalf("large write produced %d connection writes, want two PSH frames and one control frame", len(writes))
+	if len(writes) != 4 {
+		t.Fatalf("large write produced %d connection writes, want three PSH frames and one control frame", len(writes))
 	}
-	wantCommands := []byte{anyTLSCmdPSH, anyTLSCmdPSH, anyTLSCmdHeartResponse}
-	wantLengths := []int{65535, 1, 0}
+	wantCommands := []byte{anyTLSCmdPSH, anyTLSCmdPSH, anyTLSCmdPSH, anyTLSCmdHeartResponse}
+	wantLengths := []int{anyTLSFramePayloadSize, anyTLSFramePayloadSize, len(payload) - 2*anyTLSFramePayloadSize, 0}
 	for index, frame := range writes {
 		if len(frame) < anyTLSFrameHeaderSize {
 			t.Fatalf("write %d is shorter than an AnyTLS frame header", index)
@@ -1169,7 +1171,14 @@ func TestAnyTLSConcurrentDownlinkThroughput(t *testing.T) {
 	}
 }
 
-func TestAnyTLSWriteMultiBufferCoalescesFrames(t *testing.T) {
+func TestAnyTLSWriteMultiBufferPacksPoolAlignedFrames(t *testing.T) {
+	frame := buf.NewWithSize(anyTLSFrameHeaderSize + anyTLSFramePayloadSize)
+	if capacity := len(frame.WritableBytes()); capacity != anyTLSFrameBufferSize {
+		frame.Release()
+		t.Fatalf("pool-aligned AnyTLS frame has capacity %d, want %d", capacity, anyTLSFrameBufferSize)
+	}
+	frame.Release()
+
 	serverConn, clientConn := stdnet.Pipe()
 	defer clientConn.Close()
 	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
@@ -1191,7 +1200,7 @@ func TestAnyTLSWriteMultiBufferCoalescesFrames(t *testing.T) {
 	}()
 
 	var received []byte
-	for _, expectedLength := range []int{anyTLSWriteBatchSize, anyTLSWriteBatchSize, len(expected) - 2*anyTLSWriteBatchSize} {
+	for _, expectedLength := range []int{anyTLSFramePayloadSize, anyTLSFramePayloadSize, len(expected) - 2*anyTLSFramePayloadSize} {
 		command, streamID, payload := readTestAnyTLSFrame(t, clientConn)
 		if command != anyTLSCmdPSH || streamID != stream.id || len(payload) != expectedLength {
 			t.Fatalf("frame command=%d stream=%d length=%d, want PSH stream=%d length=%d", command, streamID, len(payload), stream.id, expectedLength)
@@ -1203,6 +1212,49 @@ func TestAnyTLSWriteMultiBufferCoalescesFrames(t *testing.T) {
 	}
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)
+	}
+	session.close()
+}
+
+func TestAnyTLSWriteMultiBufferPreservesConnectionAccounting(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer clientConn.Close()
+	counter := new(appstats.Counter)
+	countedConn := &internetstat.CounterConnection{Connection: serverConn, WriteCounter: counter}
+	session := newAnyTLSServerSession(context.Background(), countedConn, countedConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(11, session)
+
+	parts := [][]byte{
+		bytes.Repeat([]byte{1}, 20*1024),
+		bytes.Repeat([]byte{2}, 20*1024),
+		bytes.Repeat([]byte{3}, 20*1024),
+	}
+	expected := bytes.Join(parts, nil)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- stream.WriteMultiBuffer(buf.MultiBuffer{
+			buf.FromBytes(parts[0]),
+			buf.FromBytes(parts[1]),
+			buf.FromBytes(parts[2]),
+		})
+	}()
+
+	received := 0
+	frames := 0
+	for received < len(expected) {
+		command, streamID, payload := readTestAnyTLSFrame(t, clientConn)
+		if command != anyTLSCmdPSH || streamID != stream.id {
+			t.Fatalf("unexpected accounted frame: command=%d stream=%d", command, streamID)
+		}
+		received += len(payload)
+		frames++
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	wantWireBytes := int64(len(expected) + frames*anyTLSFrameHeaderSize)
+	if counter.Value() != wantWireBytes {
+		t.Fatalf("AnyTLS connection counter recorded %d bytes, want %d", counter.Value(), wantWireBytes)
 	}
 	session.close()
 }

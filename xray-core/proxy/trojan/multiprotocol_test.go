@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	stdnet "net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -348,6 +349,80 @@ type testActivity struct{}
 
 func (testActivity) Update() {}
 
+type anyTLSDeadlineRecordingConn struct {
+	stdnet.Conn
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func (c *anyTLSDeadlineRecordingConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadlines = append(c.deadlines, deadline)
+	c.mu.Unlock()
+	return c.Conn.SetWriteDeadline(deadline)
+}
+
+func (c *anyTLSDeadlineRecordingConn) recordedDeadlines() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.deadlines...)
+}
+
+type anyTLSGatedWriteConn struct {
+	mu                sync.Mutex
+	writes            [][]byte
+	firstWriteStarted chan struct{}
+	releaseFirstWrite chan struct{}
+	firstWriteOnce    sync.Once
+	writeDeadlineSet  chan struct{}
+	deadlineOnce      sync.Once
+}
+
+func newAnyTLSGatedWriteConn() *anyTLSGatedWriteConn {
+	return &anyTLSGatedWriteConn{
+		firstWriteStarted: make(chan struct{}),
+		releaseFirstWrite: make(chan struct{}),
+		writeDeadlineSet:  make(chan struct{}),
+	}
+}
+
+func (c *anyTLSGatedWriteConn) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (c *anyTLSGatedWriteConn) Write(payload []byte) (int, error) {
+	copyOfPayload := append([]byte(nil), payload...)
+	c.mu.Lock()
+	c.writes = append(c.writes, copyOfPayload)
+	first := len(c.writes) == 1
+	c.mu.Unlock()
+	if first {
+		c.firstWriteOnce.Do(func() { close(c.firstWriteStarted) })
+		<-c.releaseFirstWrite
+	}
+	return len(payload), nil
+}
+
+func (c *anyTLSGatedWriteConn) Close() error                    { return nil }
+func (c *anyTLSGatedWriteConn) LocalAddr() stdnet.Addr          { return nil }
+func (c *anyTLSGatedWriteConn) RemoteAddr() stdnet.Addr         { return nil }
+func (c *anyTLSGatedWriteConn) SetDeadline(time.Time) error     { return nil }
+func (c *anyTLSGatedWriteConn) SetReadDeadline(time.Time) error { return nil }
+func (c *anyTLSGatedWriteConn) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		c.deadlineOnce.Do(func() { close(c.writeDeadlineSet) })
+	}
+	return nil
+}
+
+func (c *anyTLSGatedWriteConn) recordedWrites() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	writes := make([][]byte, len(c.writes))
+	for index, payload := range c.writes {
+		writes[index] = append([]byte(nil), payload...)
+	}
+	return writes
+}
+
 func writeTestAnyTLSFrame(t *testing.T, writer io.Writer, command byte, streamID uint32, data []byte) {
 	t.Helper()
 	frame := make([]byte, anyTLSFrameHeaderSize+len(data))
@@ -371,6 +446,128 @@ func readTestAnyTLSFrame(t *testing.T, reader io.Reader) (byte, uint32, []byte) 
 		t.Fatal(err)
 	}
 	return header[0], binary.BigEndian.Uint32(header[1:5]), data
+}
+
+func TestAnyTLSControlFrameUsesBoundedWriteDeadline(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer clientConn.Close()
+	conn := &anyTLSDeadlineRecordingConn{Conn: serverConn}
+	session := newAnyTLSServerSession(context.Background(), conn, conn, testActivity{}, func(*anyTLSStream) {})
+
+	started := time.Now()
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- session.writeControlFrame(anyTLSCmdHeartResponse, 9, nil)
+	}()
+	command, streamID, data := readTestAnyTLSFrame(t, clientConn)
+	if command != anyTLSCmdHeartResponse || streamID != 9 || len(data) != 0 {
+		t.Fatalf("unexpected control frame: command=%d stream=%d data=%x", command, streamID, data)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	deadlines := conn.recordedDeadlines()
+	if len(deadlines) != 2 {
+		t.Fatalf("control write installed %d deadlines, want set and clear", len(deadlines))
+	}
+	if deadlines[0].Before(started.Add(anyTLSControlTimeout-time.Second)) || deadlines[0].After(time.Now().Add(anyTLSControlTimeout)) {
+		t.Fatalf("unexpected AnyTLS control deadline: %s", deadlines[0])
+	}
+	if !deadlines[1].IsZero() {
+		t.Fatalf("AnyTLS control deadline was not cleared: %s", deadlines[1])
+	}
+	session.close()
+}
+
+func TestAnyTLSStreamWriteDeadline(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(3, session)
+
+	if err := stream.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write([]byte("expired")); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired stream write returned %v, want deadline exceeded", err)
+	}
+	if err := stream.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := stream.Write([]byte("ok"))
+		writeDone <- err
+	}()
+	command, streamID, data := readTestAnyTLSFrame(t, clientConn)
+	if command != anyTLSCmdPSH || streamID != stream.id || string(data) != "ok" {
+		t.Fatalf("unexpected data after clearing deadline: command=%d stream=%d data=%q", command, streamID, data)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	stream.abortRemote()
+	session.close()
+}
+
+func TestAnyTLSLargeWriteFramesStayContiguous(t *testing.T) {
+	conn := newAnyTLSGatedWriteConn()
+	session := newAnyTLSServerSession(context.Background(), conn, conn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(5, session)
+	payload := bytes.Repeat([]byte{0x5a}, 65536)
+
+	dataDone := make(chan error, 1)
+	go func() {
+		written, err := stream.Write(payload)
+		if err == nil && written != len(payload) {
+			err = fmt.Errorf("large write returned %d bytes, want %d", written, len(payload))
+		}
+		dataDone <- err
+	}()
+	select {
+	case <-conn.firstWriteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("large AnyTLS write did not start")
+	}
+
+	controlStarted := make(chan struct{})
+	controlDone := make(chan error, 1)
+	go func() {
+		close(controlStarted)
+		controlDone <- session.writeControlFrame(anyTLSCmdHeartResponse, 0, nil)
+	}()
+	<-controlStarted
+	select {
+	case <-conn.writeDeadlineSet:
+		// The deadline must be active while the control writer waits for a data
+		// write that is already holding writeMu.
+	case <-time.After(time.Second):
+		t.Fatal("control deadline was not installed before waiting for the data writer")
+	}
+	close(conn.releaseFirstWrite)
+	if err := <-dataDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-controlDone; err != nil {
+		t.Fatal(err)
+	}
+
+	writes := conn.recordedWrites()
+	if len(writes) != 3 {
+		t.Fatalf("large write produced %d connection writes, want two PSH frames and one control frame", len(writes))
+	}
+	wantCommands := []byte{anyTLSCmdPSH, anyTLSCmdPSH, anyTLSCmdHeartResponse}
+	wantLengths := []int{65535, 1, 0}
+	for index, frame := range writes {
+		if len(frame) < anyTLSFrameHeaderSize {
+			t.Fatalf("write %d is shorter than an AnyTLS frame header", index)
+		}
+		if frame[0] != wantCommands[index] || int(binary.BigEndian.Uint16(frame[5:7])) != wantLengths[index] {
+			t.Fatalf("write %d command=%d length=%d, want command=%d length=%d", index, frame[0], binary.BigEndian.Uint16(frame[5:7]), wantCommands[index], wantLengths[index])
+		}
+	}
+	stream.abortRemote()
+	session.close()
 }
 
 func TestAnyTLSV2Session(t *testing.T) {

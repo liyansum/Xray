@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"io"
 	stdnet "net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +45,7 @@ const (
 	anyTLSFrameHeaderSize = 7
 	anyTLSUoTMagic        = "sp.v2.udp-over-tcp.arpa"
 	anyTLSWriteBatchSize  = 32 * 1024
+	anyTLSControlTimeout  = 5 * time.Second
 )
 
 var (
@@ -114,12 +116,13 @@ type anyTLSServerSession struct {
 	activity signal.ActivityUpdater
 	onStream func(*anyTLSStream)
 
-	writeMu sync.Mutex
-	mu      sync.RWMutex
-	streams map[uint32]*anyTLSStream
-	closed  chan struct{}
-	once    sync.Once
-	wg      sync.WaitGroup
+	controlMu sync.Mutex
+	writeMu   sync.Mutex
+	mu        sync.RWMutex
+	streams   map[uint32]*anyTLSStream
+	closed    chan struct{}
+	once      sync.Once
+	wg        sync.WaitGroup
 
 	receivedSettings bool
 	peerVersion      int
@@ -166,12 +169,12 @@ func (s *anyTLSServerSession) run() error {
 				// Intentionally discarded.
 			case anyTLSCmdSettings:
 				if err := s.handleSettings(data); err != nil {
-					_ = s.writeFrame(anyTLSCmdAlert, 0, []byte(err.Error()))
+					_ = s.writeControlFrame(anyTLSCmdAlert, 0, []byte(err.Error()))
 					return err
 				}
 			case anyTLSCmdSYN:
 				if !s.receivedSettings {
-					_ = s.writeFrame(anyTLSCmdAlert, 0, []byte("client did not send its settings"))
+					_ = s.writeControlFrame(anyTLSCmdAlert, 0, []byte("client did not send its settings"))
 					return errors.New("AnyTLS client did not send settings before SYN")
 				}
 				if length != 0 || streamID == 0 {
@@ -191,7 +194,7 @@ func (s *anyTLSServerSession) run() error {
 				}
 			case anyTLSCmdHeartRequest:
 				if s.peerVersion >= 2 {
-					if err := s.writeFrame(anyTLSCmdHeartResponse, streamID, nil); err != nil {
+					if err := s.writeControlFrame(anyTLSCmdHeartResponse, streamID, nil); err != nil {
 						return err
 					}
 				}
@@ -234,12 +237,12 @@ func (s *anyTLSServerSession) handleSettings(data []byte) error {
 	s.peerVersion = version
 	s.receivedSettings = true
 	if settings["padding-md5"] != anyTLSPaddingMD5 {
-		if err := s.writeFrame(anyTLSCmdUpdatePadding, 0, anyTLSPaddingScheme); err != nil {
+		if err := s.writeControlFrame(anyTLSCmdUpdatePadding, 0, anyTLSPaddingScheme); err != nil {
 			return err
 		}
 	}
 	if version >= 2 {
-		return s.writeFrame(anyTLSCmdServerSetting, 0, []byte("v=2"))
+		return s.writeControlFrame(anyTLSCmdServerSetting, 0, []byte("v=2"))
 	}
 	return nil
 }
@@ -276,12 +279,10 @@ func (s *anyTLSServerSession) removeStream(id uint32) *anyTLSStream {
 	return stream
 }
 
-func (s *anyTLSServerSession) writeFrame(command byte, streamID uint32, data []byte) error {
+func (s *anyTLSServerSession) writeFrameLocked(command byte, streamID uint32, data []byte) error {
 	if len(data) > 65535 {
 		return errors.New("AnyTLS frame payload is too large")
 	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	select {
 	case <-s.closed:
 		return io.ErrClosedPipe
@@ -301,6 +302,57 @@ func (s *anyTLSServerSession) writeFrame(command byte, streamID uint32, data []b
 	}
 	s.activity.Update()
 	return nil
+}
+
+// writeControlFrame bounds control-plane writes so an unresponsive peer cannot
+// leave session management blocked until the much longer idle timeout. Control
+// writes are serialized separately, and the connection deadline is installed
+// before waiting for writeMu so a data write stuck behind an unresponsive peer
+// is also interrupted after the official five-second bound.
+func (s *anyTLSServerSession) writeControlFrame(command byte, streamID uint32, data []byte) error {
+	err := s.writeControlFrameBounded(command, streamID, data)
+	if err != nil {
+		// Close only after all write locks have been released. Stream.Close uses
+		// sync.Once, and closing the session while holding these locks can
+		// otherwise deadlock with another stream concurrently sending FIN.
+		s.close()
+	}
+	return err
+}
+
+func (s *anyTLSServerSession) writeControlFrameBounded(command byte, streamID uint32, data []byte) error {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	select {
+	case <-s.closed:
+		return io.ErrClosedPipe
+	default:
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(anyTLSControlTimeout)); err != nil {
+		return errors.New("failed to set AnyTLS control write deadline").Base(err)
+	}
+	defer s.conn.SetWriteDeadline(time.Time{})
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.writeFrameLocked(command, streamID, data)
+}
+
+// writeDataFrames serializes the complete Stream.Write operation. A payload
+// larger than the uint16 wire limit is split into multiple PSH frames without
+// allowing another stream or control frame to be inserted between its chunks.
+func (s *anyTLSServerSession) writeDataFrames(streamID uint32, data []byte) (int, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	written := 0
+	for len(data) > 0 {
+		length := min(len(data), 65535)
+		if err := s.writeFrameLocked(anyTLSCmdPSH, streamID, data[:length]); err != nil {
+			return written, err
+		}
+		written += length
+		data = data[length:]
+	}
+	return written, nil
 }
 
 func (s *anyTLSServerSession) close() {
@@ -328,6 +380,8 @@ type anyTLSStream struct {
 
 	errMu  sync.RWMutex
 	dieErr error
+
+	writeDeadline anyTLSDeadline
 }
 
 func newAnyTLSStream(id uint32, session *anyTLSServerSession) *anyTLSStream {
@@ -335,6 +389,7 @@ func newAnyTLSStream(id uint32, session *anyTLSServerSession) *anyTLSStream {
 	stream := &anyTLSStream{
 		id: id, session: session,
 		pipeReader: pipeReader, pipeWriter: pipeWriter,
+		writeDeadline: newAnyTLSDeadline(),
 	}
 	return stream
 }
@@ -350,19 +405,15 @@ func (s *anyTLSStream) Read(payload []byte) (int, error) {
 }
 
 func (s *anyTLSStream) Write(payload []byte) (int, error) {
+	select {
+	case <-s.writeDeadline.wait():
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
 	if dieErr := s.loadError(); dieErr != nil {
 		return 0, dieErr
 	}
-	written := 0
-	for len(payload) > 0 {
-		length := min(len(payload), 65535)
-		if err := s.session.writeFrame(anyTLSCmdPSH, s.id, payload[:length]); err != nil {
-			return written, err
-		}
-		written += length
-		payload = payload[length:]
-	}
-	return written, nil
+	return s.session.writeDataFrames(s.id, payload)
 }
 
 // WriteMultiBuffer keeps Xray's stream batches contiguous instead of turning
@@ -392,14 +443,19 @@ func (s *anyTLSStream) Close() error {
 
 func (s *anyTLSStream) closeWithError(err error, notifyPeer bool) error {
 	var closeErr error = err
+	var sendFIN bool
 	s.once.Do(func() {
 		s.storeError(err)
 		_ = s.pipeReader.Close()
 		s.session.removeStream(s.id)
-		if notifyPeer {
-			closeErr = s.session.writeFrame(anyTLSCmdFIN, s.id, nil)
-		}
+		sendFIN = notifyPeer
 	})
+	// Never perform a session-level write while holding the stream's sync.Once.
+	// A failed FIN closes the whole session, which in turn closes every stream;
+	// keeping the Once locked here would create a cross-stream shutdown cycle.
+	if sendFIN {
+		closeErr = s.session.writeControlFrame(anyTLSCmdFIN, s.id, nil)
+	}
 	return closeErr
 }
 
@@ -428,7 +484,7 @@ func (s *anyTLSStream) handshakeSuccess() error {
 	var reportErr error
 	s.report.Do(func() {
 		if s.session.peerVersion >= 2 {
-			reportErr = s.session.writeFrame(anyTLSCmdSYNACK, s.id, nil)
+			reportErr = s.session.writeControlFrame(anyTLSCmdSYNACK, s.id, nil)
 		}
 	})
 	return reportErr
@@ -438,7 +494,7 @@ func (s *anyTLSStream) handshakeFailure(err error) error {
 	var reportErr error
 	s.report.Do(func() {
 		if s.session.peerVersion >= 2 {
-			reportErr = s.session.writeFrame(anyTLSCmdSYNACK, s.id, []byte(err.Error()))
+			reportErr = s.session.writeControlFrame(anyTLSCmdSYNACK, s.id, []byte(err.Error()))
 		}
 	})
 	return reportErr
@@ -447,6 +503,7 @@ func (s *anyTLSStream) handshakeFailure(err error) error {
 func (s *anyTLSStream) LocalAddr() net.Addr  { return s.session.conn.LocalAddr() }
 func (s *anyTLSStream) RemoteAddr() net.Addr { return s.session.conn.RemoteAddr() }
 func (s *anyTLSStream) SetDeadline(deadline time.Time) error {
+	s.writeDeadline.set(deadline)
 	return s.pipeReader.SetReadDeadline(deadline)
 }
 
@@ -455,7 +512,65 @@ func (s *anyTLSStream) SetReadDeadline(deadline time.Time) error {
 }
 
 func (s *anyTLSStream) SetWriteDeadline(deadline time.Time) error {
+	s.writeDeadline.set(deadline)
 	return nil
+}
+
+// anyTLSDeadline mirrors the official AnyTLS per-stream write-deadline model.
+// It deliberately does not set a deadline on the shared TLS connection, which
+// would also interrupt unrelated streams in the same session.
+type anyTLSDeadline struct {
+	mu      sync.Mutex
+	timer   *time.Timer
+	expired chan struct{}
+}
+
+func newAnyTLSDeadline() anyTLSDeadline {
+	return anyTLSDeadline{expired: make(chan struct{})}
+}
+
+func (d *anyTLSDeadline) set(deadline time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.timer != nil {
+		if !d.timer.Stop() {
+			<-d.expired
+		}
+		d.timer = nil
+	}
+	closed := channelClosed(d.expired)
+	if deadline.IsZero() {
+		if closed {
+			d.expired = make(chan struct{})
+		}
+		return
+	}
+	if delay := time.Until(deadline); delay > 0 {
+		if closed {
+			d.expired = make(chan struct{})
+		}
+		expired := d.expired
+		d.timer = time.AfterFunc(delay, func() { close(expired) })
+		return
+	}
+	if !closed {
+		close(d.expired)
+	}
+}
+
+func (d *anyTLSDeadline) wait() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.expired
+}
+
+func channelClosed(channel <-chan struct{}) bool {
+	select {
+	case <-channel:
+		return true
+	default:
+		return false
+	}
 }
 
 func anyTLSStreamContext(ctx context.Context, user *protocol.MemoryUser) context.Context {

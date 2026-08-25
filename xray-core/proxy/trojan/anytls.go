@@ -42,13 +42,16 @@ const (
 	anyTLSCmdHeartResponse byte = 9
 	anyTLSCmdServerSetting byte = 10
 
-	anyTLSFrameHeaderSize  = 7
-	anyTLSFrameBufferSize  = 32 * 1024
-	anyTLSFramePayloadSize = anyTLSFrameBufferSize - anyTLSFrameHeaderSize
-	anyTLSLargeFrameSize   = 64 * 1024
-	anyTLSUoTMagic         = "sp.v2.udp-over-tcp.arpa"
-	anyTLSReadBatchSize    = 32 * 1024
-	anyTLSControlTimeout   = 5 * time.Second
+	anyTLSFrameHeaderSize         = 7
+	anyTLSInitialFramePayloadSize = 32 * 1024
+	anyTLSInitialFrameBufferSize  = anyTLSFrameHeaderSize + anyTLSInitialFramePayloadSize
+	anyTLSMaxFramePayloadSize     = 65535
+	anyTLSMaxFrameBufferSize      = anyTLSFrameHeaderSize + anyTLSMaxFramePayloadSize
+	anyTLSDownlinkGrowAfter       = 512 * 1000
+	anyTLSLargeFrameSize          = 64 * 1024
+	anyTLSUoTMagic                = "sp.v2.udp-over-tcp.arpa"
+	anyTLSReadBatchSize           = 32 * 1024
+	anyTLSControlTimeout          = 5 * time.Second
 )
 
 var (
@@ -354,58 +357,74 @@ func (s *anyTLSServerSession) writeControlFrameBounded(command byte, streamID ui
 	return s.writeFrameLocked(command, streamID, data)
 }
 
-// writeDataFrames serializes the complete Stream.Write operation. Payloads
-// larger than the pool-aligned frame capacity are split into multiple PSH
-// frames without allowing another stream or control frame between chunks.
-func (s *anyTLSServerSession) writeDataFrames(streamID uint32, data []byte) (int, error) {
+// writeDataFrames serializes the complete Stream.Write operation. It uses the
+// same per-stream adaptive payload size as WriteMultiBuffer while preserving
+// the existing no-interleaving behavior between chunks of one Write call.
+func (s *anyTLSServerSession) writeDataFrames(stream *anyTLSStream, data []byte) (int, error) {
+	stream.downlinkMu.Lock()
+	defer stream.downlinkMu.Unlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	written := 0
 	for len(data) > 0 {
-		length := min(len(data), anyTLSFramePayloadSize)
-		if err := s.writeFrameLocked(anyTLSCmdPSH, streamID, data[:length]); err != nil {
+		payloadSize := stream.downlinkFramePayloadSize()
+		length := min(len(data), payloadSize)
+		storage := getAnyTLSDataFrameStorage(payloadSize)
+		frame := storage[:anyTLSFrameHeaderSize+length]
+		frame[0] = anyTLSCmdPSH
+		binary.BigEndian.PutUint32(frame[1:5], stream.id)
+		binary.BigEndian.PutUint16(frame[5:7], uint16(length))
+		copy(frame[anyTLSFrameHeaderSize:], data[:length])
+		err := s.writePreparedFrameLocked(frame)
+		putAnyTLSDataFrameStorage(storage)
+		if err != nil {
 			return written, err
 		}
 		written += length
+		stream.downlinkWritten += int64(length)
 		data = data[length:]
 	}
 	return written, nil
 }
 
 // writeMultiBufferFrames builds AnyTLS PSH frames directly from Xray buffers.
-// The framed buffer is allocated only after acquiring the session write lock
-// and reused for the complete call, avoiding both the 32 KiB coalescing scratch
-// and the 128 KiB pool jump caused by a 32 KiB payload plus its 7-byte header.
+// The first 512 KB of each stream uses 32 KiB payloads; sustained transfers
+// then use the protocol maximum of 65535 bytes, matching sing-box's adaptive
+// copy model. Exact-size frame pools avoid Xray's 32-to-128 KiB pool jump.
 func (s *anyTLSServerSession) writeMultiBufferFrames(stream *anyTLSStream, payload buf.MultiBuffer) error {
 	defer func() { buf.ReleaseMulti(payload) }()
 	if payload.IsEmpty() {
 		return nil
 	}
 
+	stream.downlinkMu.Lock()
+	defer stream.downlinkMu.Unlock()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	requestedSize := min(anyTLSFrameBufferSize, int(payload.Len())+anyTLSFrameHeaderSize)
-	storage := getAnyTLSBufferStorage(requestedSize)
-	defer putAnyTLSBufferStorage(storage)
-	frame := storage[:requestedSize]
 	for !payload.IsEmpty() {
 		// WriteMultiBufferCoalesced used to call stream.Write once per batch,
 		// so preserve its per-frame deadline and stream-close checks.
 		if err := stream.checkWritable(); err != nil {
 			return err
 		}
-		payloadCapacity := min(len(frame)-anyTLSFrameHeaderSize, anyTLSFramePayloadSize)
+		payloadCapacity := stream.downlinkFramePayloadSize()
+		storage := getAnyTLSDataFrameStorage(payloadCapacity)
+		frame := storage[:anyTLSFrameHeaderSize+payloadCapacity]
 		var copied int
 		payload, copied = buf.SplitBytes(payload, frame[anyTLSFrameHeaderSize:anyTLSFrameHeaderSize+payloadCapacity])
 		if copied == 0 {
+			putAnyTLSDataFrameStorage(storage)
 			return io.ErrNoProgress
 		}
 		frame[0] = anyTLSCmdPSH
 		binary.BigEndian.PutUint32(frame[1:5], stream.id)
 		binary.BigEndian.PutUint16(frame[5:7], uint16(copied))
-		if err := s.writePreparedFrameLocked(frame[:anyTLSFrameHeaderSize+copied]); err != nil {
+		err := s.writePreparedFrameLocked(frame[:anyTLSFrameHeaderSize+copied])
+		putAnyTLSDataFrameStorage(storage)
+		if err != nil {
 			return err
 		}
+		stream.downlinkWritten += int64(copied)
 	}
 	return nil
 }
@@ -436,7 +455,9 @@ type anyTLSStream struct {
 	errMu  sync.RWMutex
 	dieErr error
 
-	writeDeadline anyTLSDeadline
+	writeDeadline   anyTLSDeadline
+	downlinkMu      sync.Mutex
+	downlinkWritten int64
 }
 
 func newAnyTLSStream(id uint32, session *anyTLSServerSession) *anyTLSStream {
@@ -459,8 +480,8 @@ func (s *anyTLSStream) Read(payload []byte) (int, error) {
 	return n, err
 }
 
-// ReadMultiBuffer lets Xray consume AnyTLS uplink data in the same 32 KiB
-// batches used by the downlink writer. Without this implementation,
+// ReadMultiBuffer lets Xray consume AnyTLS uplink data in 32 KiB batches.
+// Without this implementation,
 // buf.NewReader wraps the stream in SingleReader and splits every peer PSH
 // into 8 KiB reads, multiplying pipe rendezvous, copies and accounting work.
 // Reading through the synchronous pipe still blocks the session until the
@@ -479,7 +500,14 @@ func (s *anyTLSStream) Write(payload []byte) (int, error) {
 	if err := s.checkWritable(); err != nil {
 		return 0, err
 	}
-	return s.session.writeDataFrames(s.id, payload)
+	return s.session.writeDataFrames(s, payload)
+}
+
+func (s *anyTLSStream) downlinkFramePayloadSize() int {
+	if s.downlinkWritten >= anyTLSDownlinkGrowAfter {
+		return anyTLSMaxFramePayloadSize
+	}
+	return anyTLSInitialFramePayloadSize
 }
 
 func (s *anyTLSStream) checkWritable() error {

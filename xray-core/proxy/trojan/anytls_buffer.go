@@ -1,8 +1,45 @@
 package trojan
 
-import singbuf "github.com/sagernet/sing/common/buf"
+import (
+	"sync"
+
+	singbuf "github.com/sagernet/sing/common/buf"
+)
 
 const anyTLSMaxPooledBufferSize = 64 * 1024
+
+var (
+	anyTLSInitialDataFramePool = sync.Pool{New: func() any {
+		return new([anyTLSInitialFrameBufferSize]byte)
+	}}
+	anyTLSLargeDataFramePool = sync.Pool{New: func() any {
+		return new([anyTLSMaxFrameBufferSize]byte)
+	}}
+)
+
+func getAnyTLSDataFrameStorage(payloadCapacity int) []byte {
+	switch {
+	case payloadCapacity <= 0:
+		panic("invalid AnyTLS data frame payload capacity")
+	case payloadCapacity <= anyTLSInitialFramePayloadSize:
+		return anyTLSInitialDataFramePool.Get().(*[anyTLSInitialFrameBufferSize]byte)[:]
+	case payloadCapacity <= anyTLSMaxFramePayloadSize:
+		return anyTLSLargeDataFramePool.Get().(*[anyTLSMaxFrameBufferSize]byte)[:]
+	default:
+		panic("AnyTLS data frame payload capacity is too large")
+	}
+}
+
+func putAnyTLSDataFrameStorage(storage []byte) {
+	switch cap(storage) {
+	case anyTLSInitialFrameBufferSize:
+		anyTLSInitialDataFramePool.Put((*[anyTLSInitialFrameBufferSize]byte)(storage[:anyTLSInitialFrameBufferSize]))
+	case anyTLSMaxFrameBufferSize:
+		anyTLSLargeDataFramePool.Put((*[anyTLSMaxFrameBufferSize]byte)(storage[:anyTLSMaxFrameBufferSize]))
+	default:
+		panic("invalid AnyTLS data frame storage")
+	}
+}
 
 // AnyTLS frames use uint16 payload lengths. Reuse the same 64B..64KiB
 // power-of-two allocator as sing-anytls instead of Xray's coarser

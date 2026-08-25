@@ -555,11 +555,11 @@ func TestAnyTLSLargeWriteFramesStayContiguous(t *testing.T) {
 	}
 
 	writes := conn.recordedWrites()
-	if len(writes) != 4 {
-		t.Fatalf("large write produced %d connection writes, want three PSH frames and one control frame", len(writes))
+	if len(writes) != 3 {
+		t.Fatalf("large write produced %d connection writes, want two PSH frames and one control frame", len(writes))
 	}
-	wantCommands := []byte{anyTLSCmdPSH, anyTLSCmdPSH, anyTLSCmdPSH, anyTLSCmdHeartResponse}
-	wantLengths := []int{anyTLSFramePayloadSize, anyTLSFramePayloadSize, len(payload) - 2*anyTLSFramePayloadSize, 0}
+	wantCommands := []byte{anyTLSCmdPSH, anyTLSCmdPSH, anyTLSCmdHeartResponse}
+	wantLengths := []int{anyTLSInitialFramePayloadSize, len(payload) - anyTLSInitialFramePayloadSize, 0}
 	for index, frame := range writes {
 		if len(frame) < anyTLSFrameHeaderSize {
 			t.Fatalf("write %d is shorter than an AnyTLS frame header", index)
@@ -993,8 +993,8 @@ func TestAnyTLSUplinkFramePoolClasses(t *testing.T) {
 		{65, 128},
 		{8192, 8192},
 		{8193, 16384},
-		{anyTLSFrameBufferSize, anyTLSFrameBufferSize},
-		{anyTLSFrameBufferSize + 1, anyTLSLargeFrameSize},
+		{anyTLSInitialFrameBufferSize, anyTLSLargeFrameSize},
+		{anyTLSInitialFrameBufferSize + 1, anyTLSLargeFrameSize},
 		{65535, anyTLSLargeFrameSize},
 	} {
 		expected := bytes.Repeat([]byte{byte(test.length)}, test.length)
@@ -1210,12 +1210,18 @@ func TestAnyTLSConcurrentDownlinkThroughput(t *testing.T) {
 }
 
 func TestAnyTLSWriteMultiBufferPacksPoolAlignedFrames(t *testing.T) {
-	storage := getAnyTLSBufferStorage(anyTLSFrameHeaderSize + anyTLSFramePayloadSize)
-	if capacity := cap(storage); capacity != anyTLSFrameBufferSize {
-		putAnyTLSBufferStorage(storage)
-		t.Fatalf("pool-aligned AnyTLS frame has capacity %d, want %d", capacity, anyTLSFrameBufferSize)
+	storage := getAnyTLSDataFrameStorage(anyTLSInitialFramePayloadSize)
+	if capacity := cap(storage); capacity != anyTLSInitialFrameBufferSize {
+		putAnyTLSDataFrameStorage(storage)
+		t.Fatalf("pool-aligned AnyTLS frame has capacity %d, want %d", capacity, anyTLSInitialFrameBufferSize)
 	}
-	putAnyTLSBufferStorage(storage)
+	putAnyTLSDataFrameStorage(storage)
+	storage = getAnyTLSDataFrameStorage(anyTLSMaxFramePayloadSize)
+	if capacity := cap(storage); capacity != anyTLSMaxFrameBufferSize {
+		putAnyTLSDataFrameStorage(storage)
+		t.Fatalf("large AnyTLS frame has capacity %d, want %d", capacity, anyTLSMaxFrameBufferSize)
+	}
+	putAnyTLSDataFrameStorage(storage)
 
 	serverConn, clientConn := stdnet.Pipe()
 	defer clientConn.Close()
@@ -1238,7 +1244,7 @@ func TestAnyTLSWriteMultiBufferPacksPoolAlignedFrames(t *testing.T) {
 	}()
 
 	var received []byte
-	for _, expectedLength := range []int{anyTLSFramePayloadSize, anyTLSFramePayloadSize, len(expected) - 2*anyTLSFramePayloadSize} {
+	for _, expectedLength := range []int{anyTLSInitialFramePayloadSize, anyTLSInitialFramePayloadSize, len(expected) - 2*anyTLSInitialFramePayloadSize} {
 		command, streamID, payload := readTestAnyTLSFrame(t, clientConn)
 		if command != anyTLSCmdPSH || streamID != stream.id || len(payload) != expectedLength {
 			t.Fatalf("frame command=%d stream=%d length=%d, want PSH stream=%d length=%d", command, streamID, len(payload), stream.id, expectedLength)
@@ -1250,6 +1256,39 @@ func TestAnyTLSWriteMultiBufferPacksPoolAlignedFrames(t *testing.T) {
 	}
 	if err := <-writeDone; err != nil {
 		t.Fatal(err)
+	}
+	session.close()
+}
+
+func TestAnyTLSWriteMultiBufferGrowsAfterThreshold(t *testing.T) {
+	serverConn, clientConn := stdnet.Pipe()
+	defer clientConn.Close()
+	session := newAnyTLSServerSession(context.Background(), serverConn, serverConn, testActivity{}, func(*anyTLSStream) {})
+	stream := newAnyTLSStream(9, session)
+	stream.downlinkWritten = anyTLSDownlinkGrowAfter
+	payload := bytes.Repeat([]byte{0x4d}, anyTLSMaxFramePayloadSize+1)
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- stream.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)})
+	}()
+
+	var received []byte
+	for _, expectedLength := range []int{anyTLSMaxFramePayloadSize, 1} {
+		command, streamID, framePayload := readTestAnyTLSFrame(t, clientConn)
+		if command != anyTLSCmdPSH || streamID != stream.id || len(framePayload) != expectedLength {
+			t.Fatalf("frame command=%d stream=%d length=%d, want PSH stream=%d length=%d", command, streamID, len(framePayload), stream.id, expectedLength)
+		}
+		received = append(received, framePayload...)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("grown AnyTLS frames changed payload contents or order")
+	}
+	if stream.downlinkWritten != anyTLSDownlinkGrowAfter+int64(len(payload)) {
+		t.Fatalf("downlink counter=%d, want %d", stream.downlinkWritten, anyTLSDownlinkGrowAfter+int64(len(payload)))
 	}
 	session.close()
 }

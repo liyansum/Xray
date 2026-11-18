@@ -25,7 +25,7 @@
 - 支持 Trojan、Shadowsocks 和 Shadowsocks 2022 托管节点。
 - 支持 TCP、UDP、TLS、路由、DNS、DoH 和 DoQ。
 - 支持文件证书热加载和 TLS session resumption。
-- 使用 Go 1.26.11，保留 TLS 1.3 混合 ML-KEM 后量子密钥交换。
+- 使用 Go 1.27.4，保留 TLS 1.3 混合 ML-KEM 后量子密钥交换。
 
 ## 多协议入站
 
@@ -169,7 +169,7 @@ Vision 数据路径来自 MPL-2.0 的 Xray-core。AnyTLS v1/v2 和 UoT v2 依据
 
 ## 编译
 
-要求 Go `1.26.11`：
+要求 Go `1.27.4`：
 
 ```bash
 git clone https://github.com/liyansum/Xray.git
@@ -188,7 +188,7 @@ sha256sum XrayR-linux-amd64-v3 > XrayR-linux-amd64-v3.sha256
 
 默认生成静态 Linux amd64-v3 二进制，构建参数包括：
 
-- Go `1.26.11`（包含当前 Go 1.26 分支的安全修复）
+- Go `1.27.4`（包含当前 Go 1.27 分支的安全修复）
 - `CGO_ENABLED=0`
 - `GOAMD64=v3`
 - `-trimpath`

@@ -57,7 +57,7 @@ func newDispatchLinkTestLink() *transport.Link {
 
 func admitProtocolConnection(dispatcher *DefaultDispatcher, protocolName, email, ip string) error {
 	ctx := dispatchLinkTestContext(protocolName, email, ip)
-	if protocolName == "vless" || protocolName == "vless-vision" {
+	if protocolName == "trojan" || protocolName == "vless" || protocolName == "vless-vision" {
 		_, err := dispatcher.wrapLink(ctx, newDispatchLinkTestLink())
 		return err
 	}

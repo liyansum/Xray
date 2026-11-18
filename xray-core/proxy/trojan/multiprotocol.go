@@ -179,7 +179,7 @@ func (s *Server) processTrojan(ctx context.Context, conn stat.Connection, reader
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From: conn.RemoteAddr(), To: destination, Status: log.AccessAccepted, Email: user.Email,
 	})
-	return s.handleConnection(ctx, sessionPolicy, destination, clientReader, buf.NewWriter(conn), dispatcher)
+	return s.handleTCPConnection(ctx, sessionPolicy, destination, clientReader, buf.NewWriter(conn), conn, dispatcher)
 }
 
 var vlessAddressParser = protocol.NewAddressParser(

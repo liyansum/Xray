@@ -8,7 +8,6 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
@@ -32,14 +31,22 @@ type Controller struct {
 	nodeInfo   *api.NodeInfo
 	Tag        string
 	userList   *[]api.UserInfo
-	tasks      []periodicTask
-	panelType  string
-	ibm        inbound.Manager
-	obm        outbound.Manager
-	stm        stats.Manager
-	dispatcher *mydispatcher.DefaultDispatcher
-	startAt    time.Time
-	logger     *log.Entry
+
+	// Pending panel generations survive API ETag/NotModified responses. Runtime
+	// progress is separate from snapshots committed after a complete sync.
+	pendingUsers  *[]api.UserInfo
+	pendingNode   *api.NodeInfo
+	runtimeNode   *api.NodeInfo
+	appliedUsers  map[string]api.UserInfo
+	removingUsers map[string]bool
+	tasks         []periodicTask
+	panelType     string
+	ibm           inbound.Manager
+	obm           outbound.Manager
+	stm           stats.Manager
+	dispatcher    *mydispatcher.DefaultDispatcher
+	startAt       time.Time
+	logger        *log.Entry
 }
 
 type periodicTask struct {
@@ -78,7 +85,7 @@ func (c *Controller) Start() error {
 	if err != nil {
 		return err
 	}
-	if newNodeInfo.Port == 0 {
+	if newNodeInfo == nil || newNodeInfo.Port == 0 {
 		return errors.New("server port must > 0")
 	}
 	c.nodeInfo = newNodeInfo
@@ -94,19 +101,21 @@ func (c *Controller) Start() error {
 	if err != nil {
 		return err
 	}
-
-	// sync controller userList
-	c.userList = userInfo
-
-	err = c.addNewUser(userInfo, newNodeInfo)
-	if err != nil {
-		return err
+	if userInfo == nil {
+		return errors.New("nil user snapshot")
 	}
 
+	// Install device policy before admitting users; commit only after both stages.
 	// Add Limiter
 	if err := c.AddInboundLimiter(c.Tag, newNodeInfo.SpeedLimit, userInfo, c.config.GlobalDeviceLimitConfig); err != nil {
-		c.logger.Print(err)
+		return err
 	}
+	c.appliedUsers = make(map[string]api.UserInfo)
+	if err := c.applyUserSnapshot(userInfo, newNodeInfo); err != nil {
+		return err
+	}
+	c.userList = cloneUserList(userInfo)
+	c.runtimeNode = newNodeInfo
 
 	// Update alive user list
 	if v2b, ok := c.apiClient.(*newV2board.APIClient); ok {
@@ -180,6 +189,9 @@ func (c *Controller) Close() error {
 			closeErr = errors.Join(closeErr, c.unregisterUserCounters(c.buildUserTag(&user)))
 		}
 	}
+	for email := range c.appliedUsers {
+		closeErr = errors.Join(closeErr, c.unregisterUserCounters(email))
+	}
 	return closeErr
 }
 
@@ -191,77 +203,40 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	c.monitorMu.Lock()
 	defer c.monitorMu.Unlock()
 
-	// First fetch Node Info
-	var nodeInfoChanged = true
-	newNodeInfo, err := c.apiClient.GetNodeInfo()
-	if err != nil {
-		if err.Error() == api.NodeNotModified {
-			nodeInfoChanged = false
-			newNodeInfo = c.nodeInfo
-		} else {
-			c.logger.Print(err)
+	// A fetched generation is not an applied generation. In particular, APIs
+	// cache ETags before we have finished updating the authenticator and policy.
+	if node, err := c.apiClient.GetNodeInfo(); err == nil {
+		if node == nil || node.Port == 0 {
+			c.logger.Print("invalid node snapshot: server port must > 0")
+			return nil
+		}
+		c.pendingNode = node
+	} else if err.Error() != api.NodeNotModified {
+		c.logger.Print(err)
+		return nil
+	}
+	if users, err := c.apiClient.GetUserList(); err == nil {
+		if users == nil {
+			c.logger.Print("invalid nil user snapshot")
+			return nil
+		}
+		c.pendingUsers = cloneUserList(users)
+	} else if err.Error() != api.UserNotModified {
+		c.logger.Print(err)
+		return nil
+	}
+	if c.pendingNode != nil || c.pendingUsers != nil {
+		if err := c.syncPendingSnapshots(); err != nil {
+			// Returning an error stops task.Periodic permanently. Retain pending
+			// state and retry on the next poll, including a NotModified response.
+			c.logger.Printf("Panel snapshot not applied; will retry: %s", err)
 			return nil
 		}
 	}
-	if newNodeInfo.Port == 0 {
-		return errors.New("server port must > 0")
-	}
 
-	// Update User
-	var usersChanged = true
-	newUserInfo, err := c.apiClient.GetUserList()
-
-	// Update alive user list
 	if v2b, ok := c.apiClient.(*newV2board.APIClient); ok {
 		if v, ok := c.dispatcher.Limiter.InboundInfo.Load(c.Tag); ok {
-			inboundinfo := v.(*limiter.InboundInfo)
-			inboundinfo.SetAliveList(v2b.AliveMap.Alive)
-		}
-	}
-	if err != nil {
-		if err.Error() == api.UserNotModified {
-			usersChanged = false
-			newUserInfo = c.userList
-		} else {
-			c.logger.Print(err)
-			return nil
-		}
-	}
-
-	// If nodeInfo changed
-	if nodeInfoChanged {
-		if !sameNodeConfig(c.nodeInfo, newNodeInfo) {
-			// Remove old tag
-			oldTag := c.Tag
-			err := c.removeOldTag(oldTag)
-			if err != nil {
-				c.logger.Print(err)
-				return nil
-			}
-			if c.userList != nil {
-				for _, user := range *c.userList {
-					oldEmail := fmt.Sprintf("%s|%s|%d", oldTag, user.Email, user.UID)
-					if err := c.unregisterUserCounters(oldEmail); err != nil {
-						c.logger.Print(err)
-					}
-				}
-			}
-			// Add new tag
-			c.nodeInfo = newNodeInfo
-			c.Tag = c.buildNodeTag()
-			err = c.addNewTag(newNodeInfo)
-			if err != nil {
-				c.logger.Print(err)
-				return nil
-			}
-			nodeInfoChanged = true
-			// Remove Old limiter
-			if err = c.DeleteInboundLimiter(oldTag); err != nil {
-				c.logger.Print(err)
-				return nil
-			}
-		} else {
-			nodeInfoChanged = false
+			v.(*limiter.InboundInfo).SetAliveList(v2b.AliveMap.Alive)
 		}
 	}
 
@@ -278,62 +253,6 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		}
 	}
 
-	if nodeInfoChanged {
-		err = c.addNewUser(newUserInfo, newNodeInfo)
-		if err != nil {
-			c.logger.Print(err)
-			return nil
-		}
-
-		// Add Limiter
-		if err := c.AddInboundLimiter(c.Tag, newNodeInfo.SpeedLimit, newUserInfo, c.config.GlobalDeviceLimitConfig); err != nil {
-			c.logger.Print(err)
-			return nil
-		}
-
-	} else {
-		var deleted, added []api.UserInfo
-		if usersChanged {
-			deleted, added = compareUserList(c.userList, newUserInfo)
-			if len(deleted) > 0 {
-				deletedEmail := make([]string, len(deleted))
-				for i, u := range deleted {
-					deletedEmail[i] = fmt.Sprintf("%s|%s|%d", c.Tag, u.Email, u.UID)
-				}
-				if err := c.removeUsers(deletedEmail, c.Tag); err != nil {
-					c.logger.Print(err)
-				}
-				if err := c.RemoveInboundLimiterUsers(c.Tag, deletedEmail); err != nil {
-					c.logger.Print(err)
-				}
-			}
-			if len(added) > 0 {
-				err = c.addNewUser(&added, c.nodeInfo)
-				if err != nil {
-					c.logger.Print(err)
-				}
-				// Update Limiter
-				if err := c.UpdateInboundLimiter(c.Tag, &added); err != nil {
-					c.logger.Print(err)
-				}
-			}
-		}
-		c.logger.Printf("%d user deleted, %d user added", len(deleted), len(added))
-	}
-	c.userList = newUserInfo
-	return nil
-}
-
-func (c *Controller) removeOldTag(oldTag string) (err error) {
-	err = c.removeInbound(oldTag)
-	if err != nil {
-		return err
-	}
-	err = c.removeOutbound(oldTag)
-	if err != nil {
-		return err
-	}
-	c.dispatcher.RuleManager.RemoveRule(oldTag)
 	return nil
 }
 
@@ -352,25 +271,6 @@ func (c *Controller) addNewTag(newNodeInfo *api.NodeInfo) (err error) {
 	if err := c.addOutbound(outboundConfig); err != nil {
 		return errors.Join(err, c.removeInbound(c.Tag))
 	}
-	return nil
-}
-
-func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo) (err error) {
-	var users []*protocol.User
-	switch nodeInfo.NodeType {
-	case "Trojan":
-		users = c.buildTrojanUser(userInfo)
-	case "Shadowsocks":
-		users = c.buildSSUser(userInfo, nodeInfo.CypherMethod)
-	default:
-		return fmt.Errorf("unsupported node type: %s", nodeInfo.NodeType)
-	}
-
-	err = c.addUsers(users, c.Tag)
-	if err != nil {
-		return err
-	}
-	c.logger.Printf("Added %d new users", len(*userInfo))
 	return nil
 }
 
@@ -437,7 +337,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 	// Get User traffic
 	var userTraffic []api.UserTraffic
 	var trafficSnapshots []trafficCounterSnapshot
-	for _, user := range *c.userList {
+	collectTraffic := func(user api.UserInfo) {
 		up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
 		if up > 0 || down > 0 {
 			userTraffic = append(userTraffic, api.UserTraffic{
@@ -452,6 +352,18 @@ func (c *Controller) userInfoMonitor() (err error) {
 			if downCounter != nil {
 				trafficSnapshots = append(trafficSnapshots, trafficCounterSnapshot{counter: downCounter, value: down})
 			}
+		}
+	}
+
+	// A failed generation can already contain successfully added live users.
+	// Account for those users while keeping the committed snapshot unchanged.
+	if c.appliedUsers != nil {
+		for _, user := range c.appliedUsers {
+			collectTraffic(user)
+		}
+	} else if c.userList != nil {
+		for _, user := range *c.userList {
+			collectTraffic(user)
 		}
 	}
 
@@ -510,7 +422,11 @@ func (c *Controller) userInfoMonitor() (err error) {
 }
 
 func (c *Controller) buildNodeTag() string {
-	return fmt.Sprintf("%s_%s_%d", c.nodeInfo.NodeType, c.config.ListenIP, c.nodeInfo.Port)
+	return c.nodeTag(c.nodeInfo)
+}
+
+func (c *Controller) nodeTag(node *api.NodeInfo) string {
+	return fmt.Sprintf("%s_%s_%d", node.NodeType, c.config.ListenIP, node.Port)
 }
 
 // func (c *Controller) logPrefix() string {

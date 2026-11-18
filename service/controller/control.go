@@ -2,15 +2,12 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
-	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/stats"
-	"github.com/xtls/xray-core/proxy"
 
 	"github.com/liyansum/Xray/api"
 	"github.com/liyansum/Xray/common/limiter"
@@ -54,67 +51,6 @@ func (c *Controller) addOutbound(config *core.OutboundHandlerConfig) error {
 		return err
 	}
 	return nil
-}
-
-func (c *Controller) addUsers(users []*protocol.User, tag string) error {
-	handler, err := c.ibm.GetHandler(context.Background(), tag)
-	if err != nil {
-		return fmt.Errorf("no such inbound tag: %s", err)
-	}
-	inboundInstance, ok := handler.(proxy.GetInbound)
-	if !ok {
-		return fmt.Errorf("handler %s has not implemented proxy.GetInbound", tag)
-	}
-
-	userManager, ok := inboundInstance.GetInbound().(proxy.UserManager)
-	if !ok {
-		return fmt.Errorf("handler %s has not implemented proxy.UserManager", tag)
-	}
-	added := make([]string, 0, len(users))
-	rollback := func(addErr error) error {
-		for i := len(added) - 1; i >= 0; i-- {
-			addErr = errors.Join(addErr, userManager.RemoveUser(context.Background(), added[i]))
-		}
-		return addErr
-	}
-	for _, item := range users {
-		mUser, err := item.ToMemoryUser()
-		if err != nil {
-			return rollback(err)
-		}
-		err = userManager.AddUser(context.Background(), mUser)
-		if err != nil {
-			return rollback(err)
-		}
-		added = append(added, mUser.Email)
-	}
-	return nil
-}
-
-func (c *Controller) removeUsers(users []string, tag string) error {
-	handler, err := c.ibm.GetHandler(context.Background(), tag)
-	if err != nil {
-		return fmt.Errorf("no such inbound tag: %s", err)
-	}
-	inboundInstance, ok := handler.(proxy.GetInbound)
-	if !ok {
-		return fmt.Errorf("handler %s is not implement proxy.GetInbound", tag)
-	}
-
-	userManager, ok := inboundInstance.GetInbound().(proxy.UserManager)
-	if !ok {
-		return fmt.Errorf("handler %s has not implemented proxy.UserManager", tag)
-	}
-	var removeErr error
-	for _, email := range users {
-		if err := userManager.RemoveUser(context.Background(), email); err != nil {
-			removeErr = errors.Join(removeErr, err)
-		}
-		if err := c.unregisterUserCounters(email); err != nil {
-			removeErr = errors.Join(removeErr, err)
-		}
-	}
-	return removeErr
 }
 
 func (c *Controller) unregisterUserCounters(email string) error {

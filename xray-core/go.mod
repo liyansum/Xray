@@ -1,6 +1,6 @@
 module github.com/xtls/xray-core
 
-go 1.26.11
+go 1.27.4
 
 require (
 	github.com/apernet/quic-go v0.59.1-0.20260425001925-6c6cc9bcb716

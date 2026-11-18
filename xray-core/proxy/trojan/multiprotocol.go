@@ -346,6 +346,7 @@ func (s *Server) processVLESS(ctx context.Context, conn stat.Connection, iConn s
 	var clientWriter buf.Writer = bufferedWriter
 	if flow == vlessVisionFlow {
 		trafficState := proxy.NewTrafficState(userID)
+		trafficState.DisableDirectCopy = command != protocol.RequestCommandTCP
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, conn, input, rawInput, nil)
 		visionWriter := proxy.NewVisionWriter(bufferedWriter, trafficState, false, ctx, conn, nil, nil)
 		if command == protocol.RequestCommandMux {

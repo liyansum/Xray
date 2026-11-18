@@ -115,14 +115,19 @@ func clearTestXUDPAssociation(t *testing.T, globalID [8]byte) {
 	cleanupDeadline := time.Now().Add(2 * time.Second)
 	for {
 		mux.XUDPManager.Lock()
-		cached := mux.XUDPManager.Map[globalID]
-		expiring := cached != nil && cached.Status == mux.Expiring
-		if expiring {
-			// Xray intentionally retains a closed XUDP association for one minute
-			// so a reconnect can reuse it. Remove this test entry after verifying
-			// that it reached the bounded expiry state.
-			cached.Interrupt()
-			delete(mux.XUDPManager.Map, globalID)
+		var cached *mux.XUDP
+		var expiring bool
+		for key, association := range mux.XUDPManager.Map {
+			if key.GlobalID != globalID {
+				continue
+			}
+			cached = association
+			expiring = cached.Status == mux.Expiring
+			if expiring {
+				cached.Interrupt()
+				delete(mux.XUDPManager.Map, key)
+			}
+			break
 		}
 		mux.XUDPManager.Unlock()
 		if cached == nil || expiring {

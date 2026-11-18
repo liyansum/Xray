@@ -1,6 +1,6 @@
 module github.com/liyansum/Xray
 
-go 1.26.7
+go 1.26.11
 
 require (
 	dario.cat/mergo v1.0.2
@@ -86,6 +86,7 @@ replace github.com/exoscale/egoscale => github.com/exoscale/egoscale v0.102.3
 replace github.com/xtls/xray-core => ./xray-core
 
 godebug (
+	multipathtcp=0
 	tlsmlkem=1
 	tlssecpmlkem=1
 )

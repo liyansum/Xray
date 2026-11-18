@@ -3,7 +3,6 @@ package mux
 import (
 	"context"
 	"io"
-	"runtime"
 	"sync"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/pipe"
 )
@@ -163,6 +163,7 @@ type Session struct {
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
+	readerDone   chan struct{}
 }
 
 // Close closes all resources associated with this session.
@@ -183,14 +184,11 @@ func (s *Session) Close(locked bool) error {
 		common.Interrupt(s.input)
 		common.Close(s.output)
 	} else {
-		// Stop existing handle(), then trigger writer.Close().
-		// Note that s.output may be dispatcher.SizeStatWriter.
+		// Leave EOF in place until the previous response pump has exited. A
+		// reconnect joins readerDone before Recover and installing a new pump.
 		s.input.(*pipe.Reader).ReturnAnError(io.EOF)
-		runtime.Gosched()
-		// If the error set by ReturnAnError still exists, clear it.
-		s.input.(*pipe.Reader).Recover()
 		XUDPManager.Lock()
-		if s.XUDP.Status == Active {
+		if s.XUDP.Mux == s && s.XUDP.Status == Active {
 			s.XUDP.Expire = time.Now().Add(time.Minute)
 			s.XUDP.Status = Expiring
 			errors.LogDebug(context.Background(), "XUDP put ", s.XUDP.GlobalID)
@@ -215,7 +213,26 @@ const (
 	Expiring     = 2
 )
 
+// XUDPKey scopes client-supplied IDs to the authenticated registry entry and
+// source device. Replacing a panel user cannot reuse its old policy/UDP link.
+type XUDPKey struct {
+	GlobalID   [8]byte
+	InboundTag string
+	User       *protocol.MemoryUser
+	Source     string
+}
+
+func xudpKey(ctx context.Context, id [8]byte) XUDPKey {
+	in := session.InboundFromContext(ctx)
+	key := XUDPKey{GlobalID: id, InboundTag: in.Tag, User: in.User}
+	if in.Source.Address != nil {
+		key.Source = in.Source.Address.String()
+	}
+	return key
+}
+
 type XUDP struct {
+	Key      XUDPKey
 	GlobalID [8]byte
 	Status   uint64
 	Expire   time.Time
@@ -229,11 +246,11 @@ func (x *XUDP) Interrupt() {
 
 var XUDPManager struct {
 	sync.Mutex
-	Map map[[8]byte]*XUDP
+	Map map[XUDPKey]*XUDP
 }
 
 func init() {
-	XUDPManager.Map = make(map[[8]byte]*XUDP)
+	XUDPManager.Map = make(map[XUDPKey]*XUDP)
 	go func() {
 		for {
 			time.Sleep(time.Minute)

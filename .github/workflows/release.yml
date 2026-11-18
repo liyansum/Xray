@@ -57,15 +57,18 @@ jobs:
       - name: Verify embedded core
         working-directory: xray-core
         run: |
-          go test ./proxy/trojan ./proxy/shadowsocks ./proxy/socks ./infra/conf
+          go test ./proxy ./common/mux ./proxy/trojan ./proxy/shadowsocks ./proxy/socks ./infra/conf
+          CGO_ENABLED=1 go test -race ./proxy ./common/mux ./proxy/trojan
           go test ./transport/internet/tls \
             -run '^(TestCertificateIssuing|TestExpiredCertificate|TestInsecureCertificates)$'
+
+      - name: Verify service limits
+        run: CGO_ENABLED=1 go test -race ./app/mydispatcher ./common/limiter
 
       - name: Build release binary
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" \
-            -o dist/XrayR-linux-amd64-v3 .
+          BINARY=dist/XrayR-linux-amd64-v3 ./build.sh
           cd dist
           sha256sum XrayR-linux-amd64-v3 \
             > XrayR-linux-amd64-v3.sha256

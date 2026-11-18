@@ -87,6 +87,7 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
 		network = addr.Network()
 		address = addr.String()
 		lc.Control = getControlFunc(ctx, sockopt, dl.controllers)
+		lc.SetMultipathTCP(sockopt != nil && sockopt.TcpMptcp)
 		// default disable keepalive
 		lc.KeepAlive = -1
 		if sockopt != nil {
@@ -106,9 +107,6 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
 			if sockopt.TcpKeepAliveInterval > 0 {
 				lc.KeepAliveConfig.Enable = true
 				lc.KeepAliveConfig.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
-			}
-			if sockopt.TcpMptcp {
-				lc.SetMultipathTCP(true)
 			}
 		}
 	case *net.UnixAddr:

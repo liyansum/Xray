@@ -238,6 +238,9 @@ func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) 
 			return nil, newError("Devices reach the limit: ", user.Email)
 		}
 		if limited {
+			// Raw Vision writes must still pass through the aggregate limiter.
+			// This disables kernel splice, not Vision direct copy.
+			sessionInbound.CanSpliceCopy = 3
 			// Both directions intentionally share the user's aggregate bucket.
 			if ob := session.OutboundsFromContext(ctx); len(ob) != 0 && ob[len(ob)-1].Target.Network == net.Network_UDP {
 				link.Reader = d.Limiter.RatePacketReader(ctx, link.Reader, bucket)

@@ -1,6 +1,6 @@
 module github.com/xtls/xray-core
 
-go 1.26.7
+go 1.26.11
 
 require (
 	github.com/apernet/quic-go v0.59.1-0.20260425001925-6c6cc9bcb716
@@ -36,3 +36,6 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// Keep ordinary TCP as the build default; sockopt.tcpMptcp remains opt-in.
+godebug multipathtcp=0

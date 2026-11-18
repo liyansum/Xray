@@ -115,10 +115,10 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		KeepAliveConfig: keepAliveConfig,
 	}
 
+	// Keep plain TCP as the default, including when GODEBUG enables MPTCP.
+	dialer.SetMultipathTCP(sockopt != nil && sockopt.TcpMptcp)
+
 	if sockopt != nil || len(Controllers) > 0 {
-		if sockopt != nil && sockopt.TcpMptcp {
-			dialer.SetMultipathTCP(true)
-		}
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
 			for _, ctl := range Controllers {
 				if err := ctl(network, address, c); err != nil {

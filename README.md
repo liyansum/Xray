@@ -25,7 +25,7 @@
 - 支持 Trojan、Shadowsocks 和 Shadowsocks 2022 托管节点。
 - 支持 TCP、UDP、TLS、路由、DNS、DoH 和 DoQ。
 - 支持文件证书热加载和 TLS session resumption。
-- 使用 Go 1.26.7，保留 TLS 1.3 混合 ML-KEM 后量子密钥交换。
+- 使用 Go 1.26.11，保留 TLS 1.3 混合 ML-KEM 后量子密钥交换。
 
 ## 多协议入站
 
@@ -49,6 +49,14 @@ UDP/443 在服务端没有特殊封锁，QUIC 与其他 UDP 目标使用同一�
 AnyTLS 接受协议版本 1 和 2，并按照客户端上报的版本协商：v1 不发送 v2 专有的 ServerSettings、SYNACK 或心跳控制帧；v2 保持完整协商和连接存活检测。客户端按规范为 stream 分配单调递增的 ID；服务端与官方 AnyTLS、sing-anytls 一致，不把不同 ID 的 SYN 到达次序作为 session 级致命错误，并静默忽略当前仍活跃 ID 的重复 SYN。服务端不限制同时活跃的 stream 数量。每条复用 stream 都使用独立路由上下文并继承同一个面板用户，因此流量统计、限速和设备限制仍按照原用户归集。两个 AnyTLS 会话版本的 UDP 都使用规范指定的 `sp.v2.udp-over-tcp.arpa` 和 UoT v2 数据格式。
 
 AnyTLS 接收端采用官方 AnyTLS 和 sing-box 相同的同步 stream 模型：每条 stream 对应一个无内部队列的同步 pipe，PSH 数据被该 stream 的处理协程消费后，会话才继续读取下一帧。内存反压直接沿 pipe、TLS 和 TCP 接收窗口传回客户端，不再使用项目自定义的单 stream、单会话或全局缓存预算。上行由 stream 直接向 Xray 提供最大 32 KiB 的 `MultiBuffer`，避免把客户端的大 PSH 重复拆成 8 KiB pipe 读取；对端发送 32769–65535 字节的合法大 PSH 时使用与官方 AnyTLS/sing 相同的 64 KiB 专用接收池，不会跨入 Xray 通用池的 128 KiB 档位。下行直接从 Xray 的 `MultiBuffer` 填充总长 32 KiB 的池化帧，其中 7 字节为 AnyTLS 帧头、有效载荷最大为 32761 字节。这样既不会把每个 8 KiB 内部 buffer 变成独立 TLS 写入，也不再经过额外的 32 KiB 合并 scratch，更不会因 `32 KiB + 7 字节` 跨入 128 KiB 内存池档位；AnyTLS 协议允许的 65535 字节帧上限保持不变。超过 32761 字节的一次 stream 写入会在会话写锁内连续拆帧，避免其他 stream 的帧插入；每条 stream 的写超时彼此独立，控制帧写入最多等待 5 秒，失去响应的对端不会长期阻塞会话管理。按照 AnyTLS 的常规使用方式，客户端通常为一次代理请求打开一个 session stream；同一 session 中未消费数据的 stream 会阻塞后续帧。用户限速在 UDP 路径上按完整数据报等待令牌，不会为了适配令牌桶 burst 而拆分游戏或 QUIC 数据报。
+
+## Vision 直拷与 XUDP 隔离
+
+Vision 按字节流跨 Buffer 和读取批次解析 TLS 记录及 ServerHello，确认支持的内层 TLS 1.3 后，在首个完整 Application Data 记录末尾切换 direct copy。切换位置可以位于当前批次中间；先刷出最后一帧 Vision/TLS 数据，再写出原始后缀，持续下载不再依赖读取边界恰好对齐。TLS 1.3 的加密握手记录也可成为切换点。TLS 1.2、未知协议及 UDP/Mux 不强制启用 direct copy。
+
+启用用户或节点限速的连接保留 Vision direct copy，但禁用绕过限速包装器的内核 splice。原始写入按实际成功写出的字节计数。Vision 双向识别状态受同步保护，初始 UUID 和命令头支持分片读取。
+
+XUDP 关联按入站、已认证用户对象、来源 IP 和客户端 GlobalID 隔离。同一用户、同一设备的重连保留复用；用户更新替换后不能沿用旧关联中的策略。重连会等待旧回包协程退出，避免新旧协程同时读取一个 UDP link。XUDP 本身继续使用外层 TLS。
 
 ## 面板与节点配置
 
@@ -161,7 +169,7 @@ Vision 数据路径来自 MPL-2.0 的 Xray-core。AnyTLS v1/v2 和 UoT v2 依据
 
 ## 编译
 
-要求 Go `1.26.7`：
+要求 Go `1.26.11`：
 
 ```bash
 git clone https://github.com/liyansum/Xray.git
@@ -180,10 +188,12 @@ sha256sum XrayR-linux-amd64-v3 > XrayR-linux-amd64-v3.sha256
 
 默认生成静态 Linux amd64-v3 二进制，构建参数包括：
 
+- Go `1.26.11`（包含当前 Go 1.26 分支的安全修复）
 - `CGO_ENABLED=0`
 - `GOAMD64=v3`
 - `-trimpath`
 - `-ldflags="-s -w"`
+- 编译默认 `GODEBUG=multipathtcp=0`；系统拨号和监听也默认使用普通 TCP，仅显式配置 `tcpMptcp: true` 时启用 MPTCP。
 
 目标 CPU 必须支持 x86-64-v3。旧处理器可使用：
 

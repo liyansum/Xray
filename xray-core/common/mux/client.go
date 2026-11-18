@@ -274,6 +274,9 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 
 	errors.LogInfo(ctx, "dispatching request to ", ob.Target)
 	if err := writeFirstPayload(s.input, writer); err != nil {
+		if !buf.IsWriteError(err) && goerrors.Is(err, io.EOF) {
+			return
+		}
 		errors.LogInfoInner(ctx, err, "failed to write first payload")
 		writer.hasError = true
 		return

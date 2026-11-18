@@ -1,6 +1,7 @@
 package mydispatcher
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -53,5 +54,25 @@ func TestDirectReaderDrainsSniffCacheAndPendingRead(t *testing.T) {
 	conn, c := reader.DirectReadConn()
 	if conn != a || c != counter || counter.Value() != 7 {
 		t.Fatal("direct readiness or accounting was lost")
+	}
+}
+
+func TestDirectReaderCannotBypassPendingTerminalError(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	source := &cacheEOFReader{conn: a, err: io.EOF}
+	reader := &cachedReader{reader: source}
+	preview := buf.New()
+	defer preview.Release()
+	if err := reader.Cache(preview, time.Second); err != io.EOF {
+		t.Fatal(err)
+	}
+	if conn, _ := reader.DirectReadConn(); conn != nil {
+		t.Fatal("raw copy bypassed pending EOF")
+	}
+	reader.Interrupt()
+	if conn, _ := reader.DirectReadConn(); conn != nil {
+		t.Fatal("raw copy bypassed interruption")
 	}
 }

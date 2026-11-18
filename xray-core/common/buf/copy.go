@@ -128,8 +128,12 @@ func CopyOnceTimeout(reader Reader, writer Writer, timeout time.Duration) error 
 		return ErrNotTimeoutReader
 	}
 	mb, err := timeoutReader.ReadMultiBufferTimeout(timeout)
-	if err != nil {
+	if err != nil && mb.IsEmpty() {
+		ReleaseMulti(mb)
 		return err
 	}
-	return writer.WriteMultiBuffer(mb)
+	if writeErr := writer.WriteMultiBuffer(mb); writeErr != nil {
+		return writeError{writeErr}
+	}
+	return err
 }

@@ -5,6 +5,7 @@ package mydispatcher
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -35,62 +36,78 @@ var errSniffingTimeout = newError("timeout on sniffing")
 
 type cachedReader struct {
 	sync.Mutex
-	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
-	cache  buf.MultiBuffer
+	reader      buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
+	cache       buf.MultiBuffer
+	err         error
+	interrupted bool
 }
 
+// Cache must preserve data returned together with an error. In particular,
+// TLS 1.2 may return the final application record together with close_notify.
 func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
-	mb, err := r.reader.ReadMultiBufferTimeout(deadline)
-	if err != nil {
-		return err
-	}
 	r.Lock()
-	if !mb.IsEmpty() {
-		r.cache, _ = buf.MergeMulti(r.cache, mb)
+	pending := r.err
+	r.Unlock()
+	if pending != nil {
+		return pending
 	}
+	mb, err := r.reader.ReadMultiBufferTimeout(deadline)
+	r.Lock()
+	defer r.Unlock()
+	if r.interrupted {
+		buf.ReleaseMulti(mb)
+		return io.ErrClosedPipe
+	}
+	hasData := !mb.IsEmpty()
+	if hasData {
+		r.cache, _ = buf.MergeMulti(r.cache, mb)
+	} else {
+		buf.ReleaseMulti(mb)
+	}
+	r.err = err
 	b.Clear()
 	rawBytes := b.Extend(min(r.cache.Len(), b.Cap()))
 	n := r.cache.Copy(rawBytes)
 	b.Resize(0, int32(n))
-	r.Unlock()
-	return nil
+	// Let the sniffer inspect the final bytes before exposing the error. The
+	// outbound subsequently receives the cached data and its original error.
+	if hasData {
+		return nil
+	}
+	return err
 }
 
-func (r *cachedReader) readInternal() buf.MultiBuffer {
+func (r *cachedReader) readInternal() (buf.MultiBuffer, error) {
 	r.Lock()
 	defer r.Unlock()
-
-	if r.cache != nil && !r.cache.IsEmpty() {
-		mb := r.cache
-		r.cache = nil
-		return mb
+	mb, err := r.cache, r.err
+	r.cache = nil
+	if !r.interrupted {
+		r.err = nil
 	}
-
-	return nil
+	return mb, err
 }
 
 func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	mb := r.readInternal()
-	if mb != nil {
-		return mb, nil
+	mb, err := r.readInternal()
+	if !mb.IsEmpty() || err != nil {
+		return mb, err
 	}
-
 	return r.reader.ReadMultiBuffer()
 }
 
 func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
-	mb := r.readInternal()
-	if mb != nil {
-		return mb, nil
+	mb, err := r.readInternal()
+	if !mb.IsEmpty() || err != nil {
+		return mb, err
 	}
-
 	return r.reader.ReadMultiBufferTimeout(timeout)
 }
 
 func (r *cachedReader) DirectReadConn() (net.Conn, stats.Counter) {
 	r.Lock()
 	defer r.Unlock()
-	if !r.cache.IsEmpty() {
+	if !r.cache.IsEmpty() || r.err != nil {
 		return nil, nil
 	}
 	if direct, ok := r.reader.(buf.DirectReader); ok {
@@ -101,6 +118,8 @@ func (r *cachedReader) DirectReadConn() (net.Conn, stats.Counter) {
 
 func (r *cachedReader) Interrupt() {
 	r.Lock()
+	r.interrupted = true
+	r.err = io.ErrClosedPipe
 	if r.cache != nil {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}

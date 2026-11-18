@@ -41,6 +41,9 @@ type BufferedReader struct {
 	Reader Reader
 	// Buffer is the internal buffer to be read from first
 	Buffer MultiBuffer
+	// ReadError accompanies Buffer and is reported after its bytes are consumed.
+	// Callers can also use it to preserve an error from a prefetched batch.
+	ReadError error
 	// Splitter is a function to read bytes from MultiBuffer
 	Splitter func(MultiBuffer, []byte) (MultiBuffer, int)
 }
@@ -59,6 +62,9 @@ func (r *BufferedReader) ReadByte() (byte, error) {
 
 // Read implements io.Reader. It reads from internal buffer first (if available) and then reads from the underlying reader.
 func (r *BufferedReader) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	spliter := r.Splitter
 	if spliter == nil {
 		spliter = SplitBytes
@@ -73,16 +79,28 @@ func (r *BufferedReader) Read(b []byte) (int, error) {
 		return nBytes, nil
 	}
 
-	mb, err := r.Reader.ReadMultiBuffer()
-	if err != nil {
-		return 0, err
+	if r.ReadError != nil {
+		return 0, r.readError()
 	}
+	mb, err := r.Reader.ReadMultiBuffer()
+	r.ReadError = err
 
 	mb, nBytes := spliter(mb, b)
 	if !mb.IsEmpty() {
 		r.Buffer = mb
+	} else {
+		ReleaseMulti(mb)
+	}
+	if nBytes == 0 {
+		return 0, r.readError()
 	}
 	return nBytes, nil
+}
+
+func (r *BufferedReader) readError() error {
+	err := r.ReadError
+	r.ReadError = nil
+	return err
 }
 
 // ReadMultiBuffer implements Reader.
@@ -90,7 +108,10 @@ func (r *BufferedReader) ReadMultiBuffer() (MultiBuffer, error) {
 	if !r.Buffer.IsEmpty() {
 		mb := r.Buffer
 		r.Buffer = nil
-		return mb, nil
+		return mb, r.readError()
+	}
+	if r.ReadError != nil {
+		return nil, r.readError()
 	}
 
 	return r.Reader.ReadMultiBuffer()
@@ -99,9 +120,14 @@ func (r *BufferedReader) ReadMultiBuffer() (MultiBuffer, error) {
 // ReadAtMost returns a MultiBuffer with at most size.
 func (r *BufferedReader) ReadAtMost(size int32) (MultiBuffer, error) {
 	if r.Buffer.IsEmpty() {
+		if r.ReadError != nil {
+			return nil, r.readError()
+		}
 		mb, err := r.Reader.ReadMultiBuffer()
+		r.ReadError = err
 		if mb.IsEmpty() && err != nil {
-			return nil, err
+			ReleaseMulti(mb)
+			return nil, r.readError()
 		}
 		r.Buffer = mb
 	}
@@ -117,15 +143,7 @@ func (r *BufferedReader) ReadAtMost(size int32) (MultiBuffer, error) {
 func (r *BufferedReader) writeToInternal(writer io.Writer) (int64, error) {
 	mbWriter := NewWriter(writer)
 	var sc SizeCounter
-	if r.Buffer != nil {
-		sc.Size = int64(r.Buffer.Len())
-		if err := mbWriter.WriteMultiBuffer(r.Buffer); err != nil {
-			return 0, err
-		}
-		r.Buffer = nil
-	}
-
-	err := Copy(r.Reader, mbWriter, CountSize(&sc))
+	err := Copy(r, mbWriter, CountSize(&sc))
 	return sc.Size, err
 }
 

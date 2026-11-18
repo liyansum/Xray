@@ -158,14 +158,23 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	var kind inboundProtocol
 	var user *protocol.MemoryUser
 	var err error
+	var firstReadError error
 	for {
 		n, readErr := first.ReadFrom(conn)
 		firstLen += n
-		if readErr != nil {
+		if n == 0 && readErr != nil {
 			first.Release()
 			return errors.New("failed to read first request").Base(readErr)
 		}
 		kind, user, err = s.detectProtocol(first.Bytes())
+		if readErr != nil {
+			if err == errNeedMoreData {
+				first.Release()
+				return errors.New("truncated protocol header").Base(readErr)
+			}
+			firstReadError = readErr
+			break
+		}
 		if err == nil || err != errNeedMoreData {
 			break
 		}
@@ -176,8 +185,9 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 	}
 
 	bufferedReader := &buf.BufferedReader{
-		Reader: buf.NewReader(conn),
-		Buffer: buf.MultiBuffer{first},
+		Reader:    buf.NewReader(conn),
+		Buffer:    buf.MultiBuffer{first},
+		ReadError: firstReadError,
 	}
 	defer func() {
 		buf.ReleaseMulti(bufferedReader.Buffer)

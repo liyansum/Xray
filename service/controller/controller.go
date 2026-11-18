@@ -23,31 +23,23 @@ import (
 	"github.com/liyansum/Xray/common/serverstatus"
 )
 
-type LimitInfo struct {
-	end               int64
-	currentSpeedLimit int
-	originSpeedLimit  uint64
-}
-
 type Controller struct {
-	monitorMu    sync.Mutex
-	server       *core.Instance
-	config       *Config
-	clientInfo   api.ClientInfo
-	apiClient    api.API
-	nodeInfo     *api.NodeInfo
-	Tag          string
-	userList     *[]api.UserInfo
-	tasks        []periodicTask
-	limitedUsers map[api.UserInfo]LimitInfo
-	warnedUsers  map[api.UserInfo]int
-	panelType    string
-	ibm          inbound.Manager
-	obm          outbound.Manager
-	stm          stats.Manager
-	dispatcher   *mydispatcher.DefaultDispatcher
-	startAt      time.Time
-	logger       *log.Entry
+	monitorMu  sync.Mutex
+	server     *core.Instance
+	config     *Config
+	clientInfo api.ClientInfo
+	apiClient  api.API
+	nodeInfo   *api.NodeInfo
+	Tag        string
+	userList   *[]api.UserInfo
+	tasks      []periodicTask
+	panelType  string
+	ibm        inbound.Manager
+	obm        outbound.Manager
+	stm        stats.Manager
+	dispatcher *mydispatcher.DefaultDispatcher
+	startAt    time.Time
+	logger     *log.Entry
 }
 
 type periodicTask struct {
@@ -133,15 +125,6 @@ func (c *Controller) Start() error {
 				c.logger.Print(err)
 			}
 		}
-	}
-
-	// Init AutoSpeedLimitConfig
-	if c.config.AutoSpeedLimitConfig == nil {
-		c.config.AutoSpeedLimitConfig = &AutoSpeedLimitConfig{0, 0, 0, 0}
-	}
-	if c.config.AutoSpeedLimitConfig.Limit > 0 {
-		c.limitedUsers = make(map[api.UserInfo]LimitInfo)
-		c.warnedUsers = make(map[api.UserInfo]int)
 	}
 
 	// Add periodic tasks
@@ -247,7 +230,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 
 	// If nodeInfo changed
 	if nodeInfoChanged {
-		if !reflect.DeepEqual(c.nodeInfo, newNodeInfo) {
+		if !sameNodeConfig(c.nodeInfo, newNodeInfo) {
 			// Remove old tag
 			oldTag := c.Tag
 			err := c.removeOldTag(oldTag)
@@ -316,8 +299,6 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				deletedEmail := make([]string, len(deleted))
 				for i, u := range deleted {
 					deletedEmail[i] = fmt.Sprintf("%s|%s|%d", c.Tag, u.Email, u.UID)
-					delete(c.limitedUsers, u)
-					delete(c.warnedUsers, u)
 				}
 				if err := c.removeUsers(deletedEmail, c.Tag); err != nil {
 					c.logger.Print(err)
@@ -393,38 +374,41 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 	return nil
 }
 
+// Speed fields remain part of panel snapshots for compatibility, but changing
+// them must not restart a listener or replace an authenticated user's identity.
+func sameNodeConfig(a, b *api.NodeInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	left, right := *a, *b
+	left.SpeedLimit, right.SpeedLimit = 0, 0
+	return reflect.DeepEqual(left, right)
+}
+
 func compareUserList(old, new *[]api.UserInfo) (deleted, added []api.UserInfo) {
-	oldSet := make(map[api.UserInfo]struct{}, len(*old))
-	newSet := make(map[api.UserInfo]struct{}, len(*new))
+	oldSet := make(map[api.UserInfo]api.UserInfo, len(*old))
+	newSet := make(map[api.UserInfo]api.UserInfo, len(*new))
 	for _, v := range *old {
-		oldSet[v] = struct{}{}
+		key := v
+		key.SpeedLimit = 0
+		oldSet[key] = v
 	}
 	for _, v := range *new {
-		newSet[v] = struct{}{}
+		key := v
+		key.SpeedLimit = 0
+		newSet[key] = v
 	}
-	for v := range oldSet {
-		if _, exists := newSet[v]; !exists {
+	for key, v := range oldSet {
+		if _, exists := newSet[key]; !exists {
 			deleted = append(deleted, v)
 		}
 	}
-	for v := range newSet {
-		if _, exists := oldSet[v]; !exists {
+	for key, v := range newSet {
+		if _, exists := oldSet[key]; !exists {
 			added = append(added, v)
 		}
 	}
-
 	return deleted, added
-}
-
-func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
-	c.limitedUsers[user] = LimitInfo{
-		end:               time.Now().Unix() + int64(c.config.AutoSpeedLimitConfig.LimitDuration*60),
-		currentSpeedLimit: c.config.AutoSpeedLimitConfig.LimitSpeed,
-		originSpeedLimit:  user.SpeedLimit,
-	}
-	c.logger.Printf("Limit User: %s Speed: %d End: %s", c.buildUserTag(&user), c.config.AutoSpeedLimitConfig.LimitSpeed, time.Unix(c.limitedUsers[user].end, 0).Format("01-02 15:04:05"))
-	user.SpeedLimit = uint64((c.config.AutoSpeedLimitConfig.LimitSpeed * 1000000) / 8)
-	*silentUsers = append(*silentUsers, user)
 }
 
 func (c *Controller) userInfoMonitor() (err error) {
@@ -450,54 +434,12 @@ func (c *Controller) userInfoMonitor() (err error) {
 	if err != nil {
 		c.logger.Print(err)
 	}
-	// Unlock users
-	if c.config.AutoSpeedLimitConfig.Limit > 0 && len(c.limitedUsers) > 0 {
-		c.logger.Printf("Limited users:")
-		toReleaseUsers := make([]api.UserInfo, 0)
-		for user, limitInfo := range c.limitedUsers {
-			if time.Now().Unix() > limitInfo.end {
-				user.SpeedLimit = limitInfo.originSpeedLimit
-				toReleaseUsers = append(toReleaseUsers, user)
-				c.logger.Printf("User: %s Speed: %d End: nil (Unlimit)", c.buildUserTag(&user), user.SpeedLimit)
-				delete(c.limitedUsers, user)
-			} else {
-				c.logger.Printf("User: %s Speed: %d End: %s", c.buildUserTag(&user), limitInfo.currentSpeedLimit, time.Unix(c.limitedUsers[user].end, 0).Format("01-02 15:04:05"))
-			}
-		}
-		if len(toReleaseUsers) > 0 {
-			if err := c.UpdateInboundLimiter(c.Tag, &toReleaseUsers); err != nil {
-				c.logger.Print(err)
-			}
-		}
-	}
-
 	// Get User traffic
 	var userTraffic []api.UserTraffic
 	var trafficSnapshots []trafficCounterSnapshot
-	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
-	UpdatePeriodic := int64(c.config.UpdatePeriodic)
-	limitedUsers := make([]api.UserInfo, 0)
 	for _, user := range *c.userList {
 		up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
 		if up > 0 || down > 0 {
-			// Over speed users
-			if AutoSpeedLimit > 0 {
-				if down > AutoSpeedLimit*1000000*UpdatePeriodic/8 || up > AutoSpeedLimit*1000000*UpdatePeriodic/8 {
-					if _, ok := c.limitedUsers[user]; !ok {
-						if c.config.AutoSpeedLimitConfig.WarnTimes == 0 {
-							limitUser(c, user, &limitedUsers)
-						} else {
-							c.warnedUsers[user] += 1
-							if c.warnedUsers[user] > c.config.AutoSpeedLimitConfig.WarnTimes {
-								limitUser(c, user, &limitedUsers)
-								delete(c.warnedUsers, user)
-							}
-						}
-					}
-				} else {
-					delete(c.warnedUsers, user)
-				}
-			}
 			userTraffic = append(userTraffic, api.UserTraffic{
 				UID:      user.UID,
 				Email:    user.Email,
@@ -510,13 +452,6 @@ func (c *Controller) userInfoMonitor() (err error) {
 			if downCounter != nil {
 				trafficSnapshots = append(trafficSnapshots, trafficCounterSnapshot{counter: downCounter, value: down})
 			}
-		} else {
-			delete(c.warnedUsers, user)
-		}
-	}
-	if len(limitedUsers) > 0 {
-		if err := c.UpdateInboundLimiter(c.Tag, &limitedUsers); err != nil {
-			c.logger.Print(err)
 		}
 	}
 

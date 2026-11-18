@@ -9,7 +9,6 @@ import (
 	"context"
 	"io"
 	"runtime"
-	"time"
 
 	"github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/app/dispatcher"
@@ -95,72 +94,73 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 	return conn, readCounter, writerCounter
 }
 
-// CopyRawConnIfExist use the most efficient copy method.
-// - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
-// - writer are from *transport.Link
-func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
-	readerConn, readCounter, _ := UnwrapRawConn(readerConn)
-	writerConn, _, writeCounter := UnwrapRawConn(writerConn)
-	reader := buf.NewReader(readerConn)
-	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
-		return readV(ctx, reader, writer, timer, readCounter)
-	}
-	tc, ok := writerConn.(*net.TCPConn)
-	if !ok || readerConn == nil || writerConn == nil {
-		return readV(ctx, reader, writer, timer, readCounter)
-	}
+// splicePermitted preserves explicit transport vetoes. Directional protocol
+// readiness is checked separately, by the goroutine that owns that direction.
+func splicePermitted(ctx context.Context) bool {
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil || inbound.CanSpliceCopy == 3 {
-		return readV(ctx, reader, writer, timer, readCounter)
+		return false
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
-		return readV(ctx, reader, writer, timer, readCounter)
+		return false
 	}
 	for _, ob := range outbounds {
-		if ob.CanSpliceCopy == 3 {
-			return readV(ctx, reader, writer, timer, readCounter)
+		if ob == nil || ob.CanSpliceCopy == 3 {
+			return false
 		}
 	}
+	return true
+}
 
-	for {
-		inbound := session.InboundFromContext(ctx)
-		outbounds := session.OutboundsFromContext(ctx)
-		splice := inbound.CanSpliceCopy == 1
-		for _, ob := range outbounds {
-			if ob.CanSpliceCopy != 1 {
-				splice = false
-			}
+func spliceOutboundsReady(ctx context.Context) bool {
+	for _, ob := range session.OutboundsFromContext(ctx) {
+		if ob.CanSpliceCopy != 1 {
+			return false
 		}
-		if splice {
-			errors.LogDebug(ctx, "CopyRawConn splice")
-			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
-			//runtime.Gosched() // necessary
-			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
-			if inTimer != nil {
-				inTimer.SetTimeout(24 * time.Hour)
+	}
+	return true
+}
+
+// CopyRawConnIfExist copies a raw response, switching to splice only after the
+// protocol writer has flushed its transition and any raw suffix.
+func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
+	readerConn, readCounter, _ := UnwrapRawConn(readerConn)
+	rawWriter, _, writeCounter := UnwrapRawConn(writerConn)
+	reader := buf.NewReader(readerConn)
+	_, tcp := rawWriter.(*net.TCPConn)
+	eligible := (runtime.GOOS == "linux" || runtime.GOOS == "android") && tcp && splicePermitted(ctx)
+	for {
+		if eligible {
+			var userCounter stats.Counter
+			ready := session.InboundFromContext(ctx).CanSpliceCopy == 1
+			if direct, ok := writer.(buf.DirectWriter); ok {
+				conn, counter := direct.DirectWriteConn()
+				if conn != nil {
+					rawWriter, _, writeCounter = UnwrapRawConn(conn)
+					userCounter, ready = counter, true
+				}
 			}
-			w, err := tc.ReadFrom(readerConn)
-			if readCounter != nil {
-				readCounter.Add(w) // outbound stats
+			if userCounter == nil {
+				if sw, ok := writer.(*dispatcher.SizeStatWriter); ok {
+					userCounter = sw.Counter
+				}
 			}
-			if writeCounter != nil {
-				writeCounter.Add(w) // inbound stats
+			if dst, ok := rawWriter.(*net.TCPConn); ready && ok && spliceOutboundsReady(ctx) {
+				if handled, err := spliceCopy(ctx, readerConn, dst, readCounter, writeCounter, userCounter, timer, inTimer); handled {
+					return err
+				}
+				eligible = false // unsupported; keep all wrappers in the fallback
 			}
-			if statWriter != nil {
-				statWriter.Counter.Add(w) // user stats
-			}
-			if err != nil && errors.Cause(err) != io.EOF {
-				return err
-			}
-			return nil
 		}
 		buffer, err := reader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
 			if readCounter != nil {
 				readCounter.Add(int64(buffer.Len()))
 			}
-			timer.Update()
+			if timer != nil {
+				timer.Update()
+			}
 			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
 				return werr
 			}
@@ -174,12 +174,43 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 }
 
-func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer signal.ActivityUpdater, readCounter stats.Counter) error {
-	errors.LogDebug(ctx, "CopyRawConn (maybe) readv")
-	if err := buf.Copy(reader, writer, buf.UpdateActivity(timer), buf.AddToStatCounter(readCounter)); err != nil {
-		return errors.New("failed to process response").Base(err)
+// CopyDirectReader copies a request, allowing Vision to expose its raw source
+// once all TLS, sniffing and protocol buffers have been forwarded. No shared
+// readiness flag is written by the opposite direction.
+func CopyDirectReader(ctx context.Context, reader buf.Reader, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
+	direct, ok := reader.(buf.DirectReader)
+	rawWriter, _, writeCounter := UnwrapRawConn(writerConn)
+	dst, tcp := rawWriter.(*net.TCPConn)
+	if !ok || !tcp || !splicePermitted(ctx) || (runtime.GOOS != "linux" && runtime.GOOS != "android") {
+		return buf.Copy(reader, writer, buf.UpdateActivity(timer))
 	}
-	return nil
+	eligible := true
+	for {
+		if eligible {
+			if conn, userCounter := direct.DirectReadConn(); conn != nil && spliceOutboundsReady(ctx) {
+				src, readCounter, _ := UnwrapRawConn(conn)
+				if handled, err := spliceCopy(ctx, src, dst, readCounter, writeCounter, userCounter, timer, inTimer); handled {
+					return err
+				}
+				eligible = false
+			}
+		}
+		mb, err := reader.ReadMultiBuffer()
+		if !mb.IsEmpty() {
+			if timer != nil {
+				timer.Update()
+			}
+			if werr := writer.WriteMultiBuffer(mb); werr != nil {
+				return werr
+			}
+		}
+		if err != nil {
+			if errors.Cause(err) == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {

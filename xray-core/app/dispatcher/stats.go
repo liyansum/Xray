@@ -4,6 +4,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/features/stats"
+	"net"
 )
 
 type SizeStatWriter struct {
@@ -22,4 +23,12 @@ func (w *SizeStatWriter) Close() error {
 
 func (w *SizeStatWriter) Interrupt() {
 	common.Interrupt(w.Writer)
+}
+
+func (w *SizeStatWriter) DirectWriteConn() (net.Conn, stats.Counter) {
+	if direct, ok := w.Writer.(buf.DirectWriter); ok {
+		conn, _ := direct.DirectWriteConn()
+		return conn, w.Counter
+	}
+	return nil, nil
 }

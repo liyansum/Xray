@@ -5,14 +5,17 @@ import (
 	"context"
 	"io"
 	stdnet "net"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/liyansum/Xray/api"
+	"github.com/xtls/xray-core/app/dispatcher"
+	corestats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 )
@@ -48,13 +51,26 @@ func (w *visionWriterCounter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	return w.Writer.WriteMultiBuffer(mb)
 }
 
-func TestVisionSplicePreservesRateLimit(t *testing.T) {
+type visionStatsPolicy struct{ dispatchLinkTestPolicy }
+
+func (visionStatsPolicy) ForLevel(uint32) policy.Session {
+	p := policy.SessionDefault()
+	p.Stats.UserUplink, p.Stats.UserDownlink = true, true
+	return p
+}
+
+func TestVisionSpliceIgnoresSpeedParameters(t *testing.T) {
 	const email = "node|limited@example.com|1"
 	d := newDispatchLinkTestDispatcher(t, []api.UserInfo{{UID: 1, Email: "limited@example.com", SpeedLimit: 1}})
+	manager, err := corestats.NewManager(context.Background(), new(corestats.Config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.policy, d.stats = visionStatsPolicy{}, manager
 	base := dispatchLinkTestContext("vless", email, "192.0.2.1")
 	in := session.InboundFromContext(base)
-	in.CanSpliceCopy = 2
-	base = session.ContextWithOutbounds(base, []*session.Outbound{{CanSpliceCopy: 1, Target: net.TCPDestination(net.ParseAddress("192.0.2.10"), 443)}})
+	in.CanSpliceCopy = 1
+	base = session.ContextWithOutbounds(base, []*session.Outbound{{CanSpliceCopy: 1}})
 	ctx, cancel := context.WithTimeout(base, 2*time.Second)
 	defer cancel()
 	source, sourceClient := visionTCPPair(t)
@@ -63,16 +79,12 @@ func TestVisionSplicePreservesRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if in.CanSpliceCopy != 3 {
-		t.Fatalf("splice not blocked by limiter: %d", in.CanSpliceCopy)
+	if in.CanSpliceCopy != 1 {
+		t.Fatalf("speed field vetoed splice: %d", in.CanSpliceCopy)
 	}
-	bucket, limited, reject := d.Limiter.GetUserBucket("node", email, "192.0.2.1", true)
-	if !limited || reject {
-		t.Fatal("rate limiter not active")
-	}
-	before := bucket.Tokens()
-	// VisionWriter must preserve the limiter veto while switching to raw TCP.
-	w := &visionWriterCounter{Writer: link.Writer}
+	sw := link.Writer.(*dispatcher.SizeStatWriter)
+	w := &visionWriterCounter{Writer: sw.Writer}
+	sw.Writer = w
 	payload := bytes.Repeat([]byte{0x5a}, 4096)
 	if _, err := sourceClient.Write(payload); err != nil {
 		t.Fatal(err)
@@ -80,18 +92,20 @@ func TestVisionSplicePreservesRateLimit(t *testing.T) {
 	_ = sourceClient.CloseWrite()
 	timer := signal.CancelAfterInactivity(ctx, cancel, 3*time.Second)
 	defer timer.SetTimeout(0)
-	start := time.Now()
-	if err := proxy.CopyRawConnIfExist(ctx, source, sink, w, timer, nil); err == nil {
-		t.Fatal("4096 bytes passed a 1 B/s limiter before the context deadline")
+	if err := proxy.CopyRawConnIfExist(ctx, source, sink, link.Writer, timer, nil); err != nil {
+		t.Fatal(err)
 	}
-	elapsed := time.Since(start)
-	got := make([]byte, 1)
+	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(sinkClient, got); err != nil {
 		t.Fatal(err)
 	}
-	if got[0] != payload[0] || w.calls == 0 || bucket.Tokens() >= before {
-		t.Fatalf("limiter bypassed: calls=%d tokens=%.2f", w.calls, bucket.Tokens())
+	if !bytes.Equal(got, payload) {
+		t.Fatal("forwarded payload changed")
 	}
-
-	t.Logf("configured rate=%.0f B/s burst=%d; transferred=%d bytes in %v; limiter wrapper calls=%d tokens_before=%.2f tokens_after=%.2f", bucket.Limit(), bucket.Burst(), len(got), elapsed, w.calls, before, bucket.Tokens())
+	if got := manager.GetCounter("user>>>" + email + ">>>traffic>>>downlink").Value(); got != int64(len(payload)) {
+		t.Fatalf("user counter=%d, want %d", got, len(payload))
+	}
+	if runtime.GOOS == "linux" && w.calls != 0 {
+		t.Fatalf("eligible copy used %d buffered writes", w.calls)
+	}
 }

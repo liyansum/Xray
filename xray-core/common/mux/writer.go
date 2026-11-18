@@ -63,23 +63,34 @@ func (w *Writer) writeMetaOnly() error {
 	meta := w.getNextFrameMeta()
 	b := buf.New()
 	if err := meta.WriteTo(b); err != nil {
+		b.Release()
 		return err
 	}
 	return w.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 }
 
-func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
+func frameHeader(meta FrameMetadata, data buf.MultiBuffer) (*buf.Buffer, error) {
 	frame := buf.New()
 	if len(data) == 1 {
 		frame.UDP = data[0].UDP
 	}
 	if err := meta.WriteTo(frame); err != nil {
-		return err
+		frame.Release()
+		return nil, err
 	}
 	if _, err := serial.WriteUint16(frame, uint16(data.Len())); err != nil {
+		frame.Release()
+		return nil, err
+	}
+	return frame, nil
+}
+
+func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
+	frame, err := frameHeader(meta, data)
+	if err != nil {
+		buf.ReleaseMulti(data)
 		return err
 	}
-
 	mb2 := make(buf.MultiBuffer, 0, len(data)+1)
 	mb2 = append(mb2, frame)
 	mb2 = append(mb2, data...)
@@ -95,27 +106,63 @@ func (w *Writer) writeData(mb buf.MultiBuffer) error {
 
 // WriteMultiBuffer implements buf.Writer.
 func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	defer buf.ReleaseMulti(mb)
-
+	defer func() { buf.ReleaseMulti(mb) }()
 	if mb.IsEmpty() {
 		return w.writeMetaOnly()
 	}
-
+	if w.transferType == protocol.TransferTypePacket {
+		return w.writePackets(mb)
+	}
 	for !mb.IsEmpty() {
 		var chunk buf.MultiBuffer
-		if w.transferType == protocol.TransferTypeStream {
-			mb, chunk = buf.SplitSize(mb, 8*1024)
-		} else {
-			mb2, b := buf.SplitFirst(mb)
-			mb = mb2
-			chunk = buf.MultiBuffer{b}
-		}
+		mb, chunk = buf.SplitSize(mb, 8*1024)
 		if err := w.writeData(chunk); err != nil {
 			return err
 		}
 	}
-
 	return nil
+}
+
+// Bound both bytes and frame count. Only packets already supplied by the caller
+// are grouped; each packet retains its own complete Mux metadata and length.
+const packetBatchBytes = 32 * 1024
+const packetBatchFrames = 32
+
+func (w *Writer) writePackets(mb buf.MultiBuffer) error {
+	batch := make(buf.MultiBuffer, 0, min(len(mb), packetBatchFrames)*2)
+	var size int32
+	defer func() {
+		buf.ReleaseMulti(batch)
+		buf.ReleaseMulti(mb)
+	}()
+	flush := func() error {
+		pending := batch
+		batch = nil // the underlying writer owns every submitted buffer
+		size = 0
+		return w.writer.WriteMultiBuffer(pending)
+	}
+	for !mb.IsEmpty() {
+		var packet *buf.Buffer
+		mb, packet = buf.SplitFirst(mb)
+		meta := w.getNextFrameMeta()
+		meta.Option.Set(OptionData)
+		frame, err := frameHeader(meta, buf.MultiBuffer{packet})
+		if err != nil {
+			packet.Release()
+			return err
+		}
+		frameSize := frame.Len() + packet.Len()
+		if len(batch) > 0 && (size+frameSize > packetBatchBytes || len(batch)/2 >= packetBatchFrames) {
+			if err := flush(); err != nil {
+				frame.Release()
+				packet.Release()
+				return err
+			}
+		}
+		batch = append(batch, frame, packet)
+		size += frameSize
+	}
+	return flush()
 }
 
 // Close implements common.Closable.

@@ -31,6 +31,8 @@ type CertConfig struct {
 	DisableSessionResumption bool   `mapstructure:"DisableSessionResumption"`
 }
 
+// AutoSpeedLimitConfig is retained for existing XrayR configurations; bandwidth
+// limiting is disabled and these fields have no effect on forwarding.
 type AutoSpeedLimitConfig struct {
 	Limit         int `mapstructure:"Limit"` // mbps
 	WarnTimes     int `mapstructure:"WarnTimes"`

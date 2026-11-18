@@ -121,24 +121,19 @@ func TestDispatchLinkSeparatesUsers(t *testing.T) {
 	}
 }
 
-func TestDispatchLinkAppliesSharedRateLimitWithoutExtraPipe(t *testing.T) {
+func TestDispatchLinkIgnoresSpeedWithoutExtraPipe(t *testing.T) {
 	const email = "node|limited@example.com|1"
 	dispatcher := newDispatchLinkTestDispatcher(t, []api.UserInfo{{
-		UID: 1, Email: "limited@example.com", SpeedLimit: 1024,
+		UID: 1, Email: "limited@example.com", SpeedLimit: 1,
 	}})
-
-	link, err := dispatcher.wrapLink(dispatchLinkTestContext("vless-vision", email, "192.0.2.1"), newDispatchLinkTestLink())
+	original := newDispatchLinkTestLink()
+	reader, writer := original.Reader, original.Writer
+	link, err := dispatcher.wrapLink(dispatchLinkTestContext("vless-vision", email, "192.0.2.1"), original)
 	if err != nil {
 		t.Fatal(err)
 	}
 	timeoutReader, ok := link.Reader.(*buf.TimeoutWrapperReader)
-	if !ok {
-		t.Fatalf("unexpected reader wrapper: %T", link.Reader)
-	}
-	if _, ok := timeoutReader.Reader.(*commonLimiter.Reader); !ok {
-		t.Fatalf("VLESS uplink has no rate reader: %T", timeoutReader.Reader)
-	}
-	if _, ok := link.Writer.(*commonLimiter.Writer); !ok {
-		t.Fatalf("VLESS downlink has no rate writer: %T", link.Writer)
+	if !ok || timeoutReader.Reader != reader || link.Writer != writer {
+		t.Fatal("speed field inserted a forwarding wrapper or extra pipe")
 	}
 }

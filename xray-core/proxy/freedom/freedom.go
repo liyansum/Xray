@@ -221,7 +221,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+		var copyErr error
+		if destination.Network == net.Network_TCP && h.config.Fragment == nil && useSplice.Load() && proxy.IsRAWTransportWithoutSecurity(conn) {
+			var inTimer *signal.ActivityTimer
+			if inbound := session.InboundFromContext(ctx); inbound != nil {
+				inTimer = inbound.Timer
+			}
+			copyErr = proxy.CopyDirectReader(ctx, input, conn, writer, timer, inTimer)
+		} else {
+			copyErr = buf.Copy(input, writer, buf.UpdateActivity(timer))
+		}
+		if err := copyErr; err != nil {
 			return errors.New("failed to process request").Base(err)
 		}
 

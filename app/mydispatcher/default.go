@@ -87,6 +87,18 @@ func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiB
 	return r.reader.ReadMultiBufferTimeout(timeout)
 }
 
+func (r *cachedReader) DirectReadConn() (net.Conn, stats.Counter) {
+	r.Lock()
+	defer r.Unlock()
+	if !r.cache.IsEmpty() {
+		return nil, nil
+	}
+	if direct, ok := r.reader.(buf.DirectReader); ok {
+		return direct.DirectReadConn()
+	}
+	return nil, nil
+}
+
 func (r *cachedReader) Interrupt() {
 	r.Lock()
 	if r.cache != nil {
@@ -173,8 +185,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	}
 
 	if user != nil && len(user.Email) > 0 {
-		// Speed Limit and Device Limit
-		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String(), sessionInbound.Source.Network == net.Network_TCP)
+		// Device admission and online reporting
+		reject := d.Limiter.CheckDeviceLimit(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String(), sessionInbound.Source.Network == net.Network_TCP)
 		if reject {
 			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
 			common.Close(outboundLink.Writer)
@@ -182,17 +194,6 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			common.Interrupt(outboundLink.Reader)
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, newError("Devices reach the limit: ", user.Email)
-		}
-		if ok {
-			// Uplink and downlink intentionally share one bucket: the configured
-			// speed is the user's aggregate bandwidth limit.
-			if ob := session.OutboundsFromContext(ctx); len(ob) != 0 && ob[len(ob)-1].Target.Network == net.Network_UDP {
-				inboundLink.Writer = d.Limiter.RatePacketWriter(ctx, inboundLink.Writer, bucket)
-				outboundLink.Writer = d.Limiter.RatePacketWriter(ctx, outboundLink.Writer, bucket)
-			} else {
-				inboundLink.Writer = d.Limiter.RateWriter(ctx, inboundLink.Writer, bucket)
-				outboundLink.Writer = d.Limiter.RateWriter(ctx, outboundLink.Writer, bucket)
-			}
 		}
 
 		p := d.policy.ForLevel(user.Level)
@@ -219,7 +220,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	return inboundLink, outboundLink, nil
 }
 
-// wrapLink applies the same per-user admission, aggregate rate limit and
+// wrapLink applies the same per-user admission and
 // traffic accounting as getLink without inserting another pipe pair. Keeping
 // the supplied link intact is required for VLESS Vision direct copy.
 func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) (*transport.Link, error) {
@@ -230,25 +231,12 @@ func (d *DefaultDispatcher) wrapLink(ctx context.Context, link *transport.Link) 
 	}
 
 	if user != nil && len(user.Email) > 0 {
-		bucket, limited, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String(), sessionInbound.Source.Network == net.Network_TCP)
+		reject := d.Limiter.CheckDeviceLimit(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String(), sessionInbound.Source.Network == net.Network_TCP)
 		if reject {
 			errors.LogWarning(ctx, "Devices reach the limit: ", user.Email)
 			common.Interrupt(link.Reader)
 			common.Interrupt(link.Writer)
 			return nil, newError("Devices reach the limit: ", user.Email)
-		}
-		if limited {
-			// Raw Vision writes must still pass through the aggregate limiter.
-			// This disables kernel splice, not Vision direct copy.
-			sessionInbound.CanSpliceCopy = 3
-			// Both directions intentionally share the user's aggregate bucket.
-			if ob := session.OutboundsFromContext(ctx); len(ob) != 0 && ob[len(ob)-1].Target.Network == net.Network_UDP {
-				link.Reader = d.Limiter.RatePacketReader(ctx, link.Reader, bucket)
-				link.Writer = d.Limiter.RatePacketWriter(ctx, link.Writer, bucket)
-			} else {
-				link.Reader = d.Limiter.RateReader(ctx, link.Reader, bucket)
-				link.Writer = d.Limiter.RateWriter(ctx, link.Writer, bucket)
-			}
 		}
 
 		link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}

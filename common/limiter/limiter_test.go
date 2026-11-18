@@ -1,17 +1,13 @@
 package limiter
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/liyansum/Xray/api"
-	"github.com/xtls/xray-core/common/buf"
-	"golang.org/x/time/rate"
 )
 
 func TestRemoveInboundUsersReclaimsState(t *testing.T) {
@@ -26,7 +22,6 @@ func TestRemoveInboundUsersReclaimsState(t *testing.T) {
 	value, _ := limiter.InboundInfo.Load("node")
 	inbound := value.(*InboundInfo)
 	removedEmail := "node|first@example.com|1"
-	inbound.BucketHub.Store(removedEmail, rate.NewLimiter(1, 1))
 	state := newUserDeviceState()
 	state.current["192.0.2.1"] = 1
 	inbound.userDevices.Store(removedEmail, state)
@@ -38,9 +33,6 @@ func TestRemoveInboundUsersReclaimsState(t *testing.T) {
 	}
 	if _, found := (*inbound.userInfo.Load())[removedEmail]; found {
 		t.Fatal("removed user remains in limiter snapshot")
-	}
-	if _, found := inbound.BucketHub.Load(removedEmail); found {
-		t.Fatal("removed user's rate bucket remains")
 	}
 	if _, found := inbound.userDevices.Load(removedEmail); found {
 		t.Fatal("removed user's online IP state remains")
@@ -88,13 +80,13 @@ func TestDeviceLimitCountsPanelBaselineAndCurrentPeriod(t *testing.T) {
 	inbound.SetAliveList(map[int]int{1: 1})
 	email := "node|user@example.com|1"
 
-	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+	if reject := limiter.CheckDeviceLimit("node", email, "192.0.2.1", true); reject {
 		t.Fatal("first current-period device was rejected")
 	}
-	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.2", true); !reject {
+	if reject := limiter.CheckDeviceLimit("node", email, "192.0.2.2", true); !reject {
 		t.Fatal("device exceeding panel baseline plus local additions was accepted")
 	}
-	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+	if reject := limiter.CheckDeviceLimit("node", email, "192.0.2.1", true); reject {
 		t.Fatal("an already accepted device consumed another slot")
 	}
 }
@@ -106,7 +98,7 @@ func TestPreviousPeriodDeviceDoesNotConsumeAnotherSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	email := "node|user@example.com|1"
-	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+	if reject := limiter.CheckDeviceLimit("node", email, "192.0.2.1", true); reject {
 		t.Fatal("initial device was rejected")
 	}
 	if _, err := limiter.GetOnlineDevice("node"); err != nil {
@@ -115,13 +107,13 @@ func TestPreviousPeriodDeviceDoesNotConsumeAnotherSlot(t *testing.T) {
 	value, _ := limiter.InboundInfo.Load("node")
 	value.(*InboundInfo).SetAliveList(map[int]int{1: 1})
 
-	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true); reject {
+	if reject := limiter.CheckDeviceLimit("node", email, "192.0.2.1", true); reject {
 		t.Fatal("previous-period device was counted twice")
 	}
-	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.2", true); reject {
+	if reject := limiter.CheckDeviceLimit("node", email, "192.0.2.2", true); reject {
 		t.Fatal("one genuinely new device should fit the remaining slot")
 	}
-	if _, _, reject := limiter.GetUserBucket("node", email, "192.0.2.3", true); !reject {
+	if reject := limiter.CheckDeviceLimit("node", email, "192.0.2.3", true); !reject {
 		t.Fatal("third device was accepted")
 	}
 }
@@ -140,7 +132,7 @@ func TestConcurrentDeviceAdmissionDoesNotExceedLimit(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, reject := limiter.GetUserBucket("node", email, fmt.Sprintf("192.0.2.%d", i), true); !reject {
+			if reject := limiter.CheckDeviceLimit("node", email, fmt.Sprintf("192.0.2.%d", i), true); !reject {
 				accepted.Add(1)
 			}
 		}()
@@ -151,66 +143,24 @@ func TestConcurrentDeviceAdmissionDoesNotExceedLimit(t *testing.T) {
 	}
 }
 
-func TestRateReaderSplitsWithoutLosingData(t *testing.T) {
-	payload := []byte("0123456789")
-	reader := New().RateReader(context.Background(), buf.NewReader(bytes.NewReader(payload)), rate.NewLimiter(rate.Inf, 4))
-	var received []byte
-	var chunkSizes []int32
-	for {
-		mb, err := reader.ReadMultiBuffer()
-		if !mb.IsEmpty() {
-			chunkSizes = append(chunkSizes, mb.Len())
-			chunk := make([]byte, mb.Len())
-			mb.Copy(chunk)
-			received = append(received, chunk...)
-			buf.ReleaseMulti(mb)
-		}
-		if err != nil {
-			if err != io.EOF {
-				t.Fatal(err)
-			}
-			break
-		}
-	}
-	if !bytes.Equal(received, payload) {
-		t.Fatalf("rate reader changed payload: got %q want %q", received, payload)
-	}
-	if fmt.Sprint(chunkSizes) != "[4 4 2]" {
-		t.Fatalf("unexpected rate-limited chunks: %v", chunkSizes)
-	}
-}
-
-func TestPacketRateWriterPreservesDatagramBoundaries(t *testing.T) {
-	first := []byte("first-datagram")
-	second := []byte("second")
-	container := new(buf.MultiBufferContainer)
-	writer := New().RatePacketWriter(context.Background(), container, rate.NewLimiter(rate.Inf, 4))
-	if err := writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(first), buf.FromBytes(second)}); err != nil {
-		t.Fatal(err)
-	}
-	defer container.Close()
-	if len(container.MultiBuffer) != 2 {
-		t.Fatalf("rate limiter changed two datagrams into %d buffers", len(container.MultiBuffer))
-	}
-	if !bytes.Equal(container.MultiBuffer[0].Bytes(), first) || !bytes.Equal(container.MultiBuffer[1].Bytes(), second) {
-		t.Fatal("rate limiter changed UDP payloads")
-	}
-}
-
-func TestUserRateBucketIsSharedAcrossConnections(t *testing.T) {
-	users := []api.UserInfo{{UID: 1, Email: "user@example.com", SpeedLimit: 1024}}
+func TestBandwidthFieldsAreIgnoredOnAddAndUpdate(t *testing.T) {
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com", SpeedLimit: 1, DeviceLimit: 1}}
 	limiter := New()
-	if err := limiter.AddInboundLimiter("node", 0, &users, nil); err != nil {
+	if err := limiter.AddInboundLimiter("node", ^uint64(0), &users, nil); err != nil {
 		t.Fatal(err)
 	}
 	email := "node|user@example.com|1"
-	first, limited, reject := limiter.GetUserBucket("node", email, "192.0.2.1", true)
-	if reject || !limited || first == nil {
-		t.Fatalf("first bucket: limited=%v reject=%v bucket=%v", limited, reject, first)
-	}
-	second, limited, reject := limiter.GetUserBucket("node", email, "192.0.2.2", true)
-	if reject || !limited || second != first {
-		t.Fatalf("second connection did not share the user bucket: limited=%v reject=%v", limited, reject)
+	for _, speed := range []uint64{1, 0, ^uint64(0)} {
+		users[0].SpeedLimit = speed
+		if err := limiter.UpdateInboundLimiter("node", &users); err != nil {
+			t.Fatal(err)
+		}
+		if limiter.CheckDeviceLimit("node", email, "192.0.2.1", true) {
+			t.Fatal("speed update rejected an admitted device")
+		}
+		if !limiter.CheckDeviceLimit("node", email, "192.0.2.2", true) {
+			t.Fatal("speed update disabled device admission")
+		}
 	}
 }
 
@@ -220,7 +170,7 @@ func TestUnknownUserDoesNotCreateDeviceState(t *testing.T) {
 	if err := limiter.AddInboundLimiter("node", 0, &users, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, reject := limiter.GetUserBucket("node", "removed@example.com", "192.0.2.1", true); reject {
+	if reject := limiter.CheckDeviceLimit("node", "removed@example.com", "192.0.2.1", true); reject {
 		t.Fatal("unknown user was rejected by stale limiter state")
 	}
 	value, _ := limiter.InboundInfo.Load("node")

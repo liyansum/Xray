@@ -19,12 +19,10 @@ import (
 	goCache "github.com/patrickmn/go-cache"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/time/rate"
 )
 
 type UserInfo struct {
 	UID         int
-	SpeedLimit  uint64
 	DeviceLimit int
 }
 
@@ -50,12 +48,6 @@ func newUserDeviceState() *userDeviceState {
 	}
 }
 
-func (s *userDeviceState) hasCurrent() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.current) != 0
-}
-
 func (s *userDeviceState) snapshotAndReset() map[string]int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -66,12 +58,10 @@ func (s *userDeviceState) snapshotAndReset() map[string]int {
 }
 
 type InboundInfo struct {
-	Tag            string
-	NodeSpeedLimit uint64
-	userInfo       atomic.Pointer[map[string]UserInfo] // Immutable; key: Email
-	BucketHub      *sync.Map                           // key: Email, value: *rate.Limiter
-	userDevices    *sync.Map                           // Key: Email, value: *userDeviceState
-	GlobalLimit    struct {
+	Tag         string
+	userInfo    atomic.Pointer[map[string]UserInfo] // Immutable; key: Email
+	userDevices *sync.Map                           // Key: Email, value: *userDeviceState
+	GlobalLimit struct {
 		config         *GlobalDeviceLimitConfig
 		globalOnlineIP *marshaler.Marshaler
 		redisClient    *redis.Client
@@ -156,7 +146,6 @@ func buildUserInfoMap(tag string, users []api.UserInfo) *map[string]UserInfo {
 	for _, user := range users {
 		userMap[fmt.Sprintf("%s|%s|%d", tag, user.Email, user.UID)] = UserInfo{
 			UID:         user.UID,
-			SpeedLimit:  user.SpeedLimit,
 			DeviceLimit: user.DeviceLimit,
 		}
 	}
@@ -176,7 +165,6 @@ func (i *InboundInfo) updateUsers(tag string, users []api.UserInfo) {
 		for _, user := range users {
 			next[fmt.Sprintf("%s|%s|%d", tag, user.Email, user.UID)] = UserInfo{
 				UID:         user.UID,
-				SpeedLimit:  user.SpeedLimit,
 				DeviceLimit: user.DeviceLimit,
 			}
 		}
@@ -212,7 +200,6 @@ func (i *InboundInfo) removeUsers(emails []string) {
 		}
 	}
 	for email := range removed {
-		i.BucketHub.Delete(email)
 		i.userDevices.Delete(email)
 	}
 	for key := range removedGlobalKeys {
@@ -242,12 +229,10 @@ func (i *InboundInfo) close() error {
 	return nil
 }
 
-func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalLimit *GlobalDeviceLimitConfig) error {
+func (l *Limiter) AddInboundLimiter(tag string, _ uint64, userList *[]api.UserInfo, globalLimit *GlobalDeviceLimitConfig) error {
 	inboundInfo := &InboundInfo{
-		Tag:            tag,
-		NodeSpeedLimit: nodeSpeedLimit,
-		BucketHub:      new(sync.Map),
-		userDevices:    new(sync.Map),
+		Tag:         tag,
+		userDevices: new(sync.Map),
 	}
 	emptyOldOnline := make(map[deviceIdentity]struct{})
 	inboundInfo.oldOnlineSet.Store(&emptyOldOnline)
@@ -294,19 +279,6 @@ func (l *Limiter) UpdateInboundLimiter(tag string, updatedUserList *[]api.UserIn
 		// Publish all user changes as one immutable snapshot. CAS avoids losing
 		// concurrent updates from the node and traffic monitor tasks.
 		inboundInfo.updateUsers(tag, *updatedUserList)
-		for _, u := range *updatedUserList {
-			// Update old limiter bucket
-			limit := determineRate(inboundInfo.NodeSpeedLimit, u.SpeedLimit)
-			if limit > 0 {
-				if bucket, ok := inboundInfo.BucketHub.Load(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID)); ok {
-					limiter := bucket.(*rate.Limiter)
-					limiter.SetLimit(rate.Limit(limit))
-					limiter.SetBurst(int(limit))
-				}
-			} else {
-				inboundInfo.BucketHub.Delete(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID))
-			}
-		}
 	} else {
 		return fmt.Errorf("no such inbound in limiter: %s", tag)
 	}
@@ -334,15 +306,6 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
 		nextOldOnline := make(map[deviceIdentity]struct{})
-		// Clear Speed Limiter bucket for users who are not online
-		inboundInfo.BucketHub.Range(func(key, value interface{}) bool {
-			email := key.(string)
-			stateValue, exists := inboundInfo.userDevices.Load(email)
-			if !exists || !stateValue.(*userDeviceState).hasCurrent() {
-				inboundInfo.BucketHub.Delete(email)
-			}
-			return true
-		})
 		inboundInfo.userDevices.Range(func(_, value interface{}) bool {
 			for ip, uid := range value.(*userDeviceState).snapshotAndReset() {
 				nextOldOnline[deviceIdentity{uid: uid, ip: ip}] = struct{}{}
@@ -360,16 +323,16 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 	return &onlineUser, nil
 }
 
-func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP bool) (limiter *rate.Limiter, SpeedLimit bool, Reject bool) {
+// CheckDeviceLimit retains device admission and online reporting. Bandwidth
+// fields are accepted by the API but never allocate buckets or delay traffic.
+func (l *Limiter) CheckDeviceLimit(tag string, email string, ip string, isSourceTCP bool) (reject bool) {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		var (
-			userLimit        uint64 = 0
 			deviceLimit, uid int
 			knownUser        bool
 		)
 
 		inboundInfo := value.(*InboundInfo)
-		nodeLimit := inboundInfo.NodeSpeedLimit
 
 		users := inboundInfo.userInfo.Load()
 		if users != nil {
@@ -377,7 +340,6 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP
 			if ok {
 				knownUser = true
 				uid = u.UID
-				userLimit = u.SpeedLimit
 				deviceLimit = u.DeviceLimit
 			}
 		}
@@ -386,31 +348,20 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string, isSourceTCP
 		// state makes admission atomic while allowing unrelated users to connect
 		// concurrently.
 		if knownUser && isSourceTCP && inboundInfo.registerDevice(email, uid, ip, deviceLimit) {
-			return nil, false, true
+			return true
 		}
 
 		// GlobalLimit
 		if knownUser && deviceLimit > 0 && inboundInfo.GlobalLimit.config != nil && inboundInfo.GlobalLimit.config.Enable {
 			if reject := globalLimit(inboundInfo, email, uid, ip, deviceLimit); reject {
-				return nil, false, true
+				return true
 			}
 		}
 
-		// Speed limit
-		limit := determineRate(nodeLimit, userLimit) // Determine the speed limit rate
-		if limit > 0 {
-			if v, ok := inboundInfo.BucketHub.Load(email); ok {
-				return v.(*rate.Limiter), true, false
-			}
-			newLimiter := rate.NewLimiter(rate.Limit(limit), int(limit)) // Byte/s
-			actual, _ := inboundInfo.BucketHub.LoadOrStore(email, newLimiter)
-			return actual.(*rate.Limiter), true, false
-		} else {
-			return nil, false, false
-		}
+		return false
 	} else {
 		log.Error("Get Inbound Limiter information failed")
-		return nil, false, false
+		return false
 	}
 }
 
@@ -466,26 +417,5 @@ func pushIP(inboundInfo *InboundInfo, uniqueKey string, ipMap *map[string]int) {
 
 	if err := inboundInfo.GlobalLimit.globalOnlineIP.Set(ctx, uniqueKey, ipMap); err != nil {
 		log.Error("cache service", err)
-	}
-}
-
-// determineRate returns the minimum non-zero rate
-func determineRate(nodeLimit, userLimit uint64) (limit uint64) {
-	if nodeLimit == 0 || userLimit == 0 {
-		if nodeLimit > userLimit {
-			return nodeLimit
-		} else if nodeLimit < userLimit {
-			return userLimit
-		} else {
-			return 0
-		}
-	} else {
-		if nodeLimit > userLimit {
-			return userLimit
-		} else if nodeLimit < userLimit {
-			return nodeLimit
-		} else {
-			return nodeLimit
-		}
 	}
 }

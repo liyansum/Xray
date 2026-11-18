@@ -132,6 +132,7 @@ type VisionReader struct {
 	// internal
 	directReadCounter stats.Counter
 	filterDone        bool
+	rawReady          bool
 }
 
 func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
@@ -230,13 +231,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			w.rawInput = nil
 		}
 
-		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
-			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
-			// 	inbound.CanSpliceCopy = 1
-			// }
-			if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // ob need to be passed in due to context can have more than one ob
-				w.ob.CanSpliceCopy = 1
-			}
+		if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 {
+			w.ob.CanSpliceCopy = 1
 		}
 		readerConn, readCounter, _ := UnwrapRawConn(w.conn)
 		w.directReadCounter = readCounter
@@ -245,6 +241,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			return nil, errors.New("missing Vision raw connection")
 		}
 		w.Reader = buf.NewReader(readerConn)
+		w.rawReady = true
 	}
 	return buffer, err
 }
@@ -322,13 +319,6 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if !tail.IsEmpty() {
 			if err := w.Writer.WriteMultiBuffer(tail); err != nil {
 				return err
-			}
-		}
-		// All old TLS writes and any raw suffix are complete before splice can
-		// bypass this writer. A limiter marks the connection ineligible (3).
-		if w.direct && !w.isUplink {
-			if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.CanSpliceCopy == 2 {
-				inbound.CanSpliceCopy = 1
 			}
 		}
 		return nil
@@ -514,3 +504,18 @@ func XtlsUnpadding(b *buf.Buffer, s *TrafficState, uplink bool, _ context.Contex
 // XtlsFilterTls retains the downlink inspection entry point. Live readers and
 // writers supply their direction and use one consistent, locked TLS snapshot.
 func XtlsFilterTls(mb buf.MultiBuffer, s *TrafficState, _ context.Context) { s.filterTLS(mb, false) }
+
+// DirectReadConn is queried only after the last returned batch was forwarded.
+func (w *VisionReader) DirectReadConn() (net.Conn, stats.Counter) {
+	if w.rawReady {
+		return w.conn, nil
+	}
+	return nil, nil
+}
+
+func (w *VisionWriter) DirectWriteConn() (net.Conn, stats.Counter) {
+	if w.direct {
+		return w.conn, nil
+	}
+	return nil, nil
+}
